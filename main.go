@@ -1,19 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
-	"strconv"
-	"strings"
-	"time"
 
-	"9fans.net/go/plan9"
+	"9fans.net/go/acme"
 	"9fans.net/go/plan9/client"
 )
 
@@ -65,74 +60,32 @@ func main() {
 	}
 }
 
-// watchLog watches acme/log and adds/removes window state as windows open/close.
-// It mounts acme fresh on each attempt so it retries correctly when started
-// before acme — the 9fans.net/go/acme package uses sync.Once and would cache
-// the first connection failure forever.
+// watchLog seeds window state from acme and then streams opens/closes from
+// acme/log.  Any failure is fatal — launchd will restart us, providing the
+// retry loop and giving acme time to come up.
 func watchLog(s *Server) {
+	wins, err := acme.Windows()
+	if err != nil {
+		log.Fatal("acme: ", err)
+	}
+	for _, w := range wins {
+		s.addWin(w.ID)
+	}
+
+	lr, err := acme.Log()
+	if err != nil {
+		log.Fatal("acme: ", err)
+	}
 	for {
-		if err := watchLogOnce(s); err != nil {
-			log.Printf("acme: %v; retrying in 2s", err)
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func watchLogOnce(s *Server) error {
-	fs, err := client.MountService("acme")
-	if err != nil {
-		return err
-	}
-	defer fs.Close()
-
-	// Seed with already-open windows by reading the index.
-	idx, err := fs.Open("index", plan9.OREAD)
-	if err != nil {
-		return fmt.Errorf("open index: %v", err)
-	}
-	sc := bufio.NewScanner(idx)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) == 0 {
-			continue
-		}
-		id, err := strconv.Atoi(fields[0])
+		ev, err := lr.Read()
 		if err != nil {
-			continue
+			log.Fatal("acme log: ", err)
 		}
-		s.addWin(id)
-	}
-	idx.Close()
-
-	// Stream future opens/closes from the log.
-	logf, err := fs.Open("log", plan9.OREAD)
-	if err != nil {
-		return fmt.Errorf("open log: %v", err)
-	}
-	defer logf.Close()
-
-	buf := make([]byte, 8192)
-	for {
-		n, err := logf.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return fmt.Errorf("read log: %v", err)
-		}
-		f := strings.SplitN(strings.TrimSpace(string(buf[:n])), " ", 3)
-		if len(f) < 2 {
-			continue
-		}
-		id, err := strconv.Atoi(f[0])
-		if err != nil {
-			continue
-		}
-		switch f[1] {
+		switch ev.Op {
 		case "new":
-			s.addWin(id)
+			s.addWin(ev.ID)
 		case "del":
-			s.delWin(id)
+			s.delWin(ev.ID)
 		}
 	}
 }
