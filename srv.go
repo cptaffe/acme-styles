@@ -365,6 +365,7 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		if mode == plan9.OREAD {
 			return rerr(fc.Tag, "permission denied")
 		}
+		// Clear the layer immediately at open; flushLayer is called at clunk.
 		w := s.getWin(f.winID)
 		if w != nil {
 			w.clearLayer(f.layID)
@@ -375,6 +376,14 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 			w := s.getWin(f.winID)
 			if w != nil {
 				f.buf = []byte(w.styleText(f.layID))
+			}
+		}
+		// For write-mode opens, clear the layer so that the subsequent writes
+		// replace rather than accumulate.  flushLayer is called at clunk.
+		if mode == plan9.OWRITE || mode == plan9.ORDWR {
+			w := s.getWin(f.winID)
+			if w != nil {
+				w.clearLayer(f.layID)
 			}
 		}
 	}
@@ -449,6 +458,18 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 }
 
 func (cn *conn) doClunk(fc *plan9.Fcall) *plan9.Fcall {
+	f := cn.fids[fc.Fid]
+	if f != nil && f.open {
+		mode := f.mode & 3
+		isWrite := mode == plan9.OWRITE || mode == plan9.ORDWR
+		if isWrite && (f.ft == ftClear || f.ft == ftStyle) {
+			// One writeStyle per fid lifetime: flush now that all writes are done.
+			w := cn.srv.getWin(f.winID)
+			if w != nil {
+				w.flushLayer()
+			}
+		}
+	}
 	delete(cn.fids, fc.Fid)
 	return &plan9.Fcall{Type: plan9.Rclunk, Tag: fc.Tag}
 }
