@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 
 	"9fans.net/go/acme"
+	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
 )
 
@@ -92,31 +94,47 @@ func watchLog(s *Server) {
 	}
 }
 
-// watchWindow opens the event file for the given acme window and tracks body
-// insertions and deletions so that layer entry positions stay correct between
-// LSP token updates.  All events are written back so editing proceeds normally.
+// watchWindow opens <winid>/log in the acme namespace and tracks body
+// insertions ("I q0 n") and deletions ("D q0 q1") to keep all layer entry
+// positions correct between LSP token updates.  The file is read-only and
+// requires no write-back, so we are never a blocking participant in any
+// event pipeline.
 func watchWindow(s *Server, id int) {
-	win, err := acme.Open(id, nil)
+	fs, err := client.MountService("acme")
 	if err != nil {
 		return
 	}
-	defer win.CloseFiles()
-	if err := win.OpenEvent(); err != nil {
-		return
+	defer fs.Close()
+
+	fid, err := fs.Open(fmt.Sprintf("%d/log", id), plan9.OREAD)
+	if err != nil {
+		return // window not found or acme too old
 	}
-	for {
-		ev, err := win.ReadEvent()
-		if err != nil {
-			return // window gone or acme exiting
+	defer fid.Close()
+
+	sc := bufio.NewScanner(fid)
+	for sc.Scan() {
+		line := sc.Text()
+		if len(line) < 5 {
+			continue
 		}
-		if ws := s.getWin(id); ws != nil {
-			switch ev.C2 {
-			case 'I':
-				ws.insertAt(ev.Q0, ev.Nr)
-			case 'D':
-				ws.deleteRange(ev.Q0, ev.Q1)
-			}
+		op := line[0]
+		if op != 'I' && op != 'D' {
+			continue
 		}
-		win.WriteEvent(ev) //nolint:errcheck
+		var a, b int
+		if n, err := fmt.Sscanf(line[2:], "%d %d", &a, &b); err != nil || n != 2 {
+			continue
+		}
+		ws := s.getWin(id)
+		if ws == nil {
+			continue
+		}
+		switch op {
+		case 'I':
+			ws.insertAt(a, b)
+		case 'D':
+			ws.deleteRange(a, b)
+		}
 	}
 }
