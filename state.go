@@ -10,7 +10,8 @@ import (
 	"strings"
 	"sync"
 
-	"9fans.net/go/acme"
+	"9fans.net/go/plan9"
+	"9fans.net/go/plan9/client"
 )
 
 // StyleMap maps style names to their numeric indices.
@@ -37,6 +38,8 @@ func loadStyles(path string) (StyleMap, error) {
 	return m, sc.Err()
 }
 
+// parseEntry parses one style line in "idx start end" format.
+// idx may be a numeric index or a name looked up in sm.
 func (sm StyleMap) parseEntry(line string) (StyleEntry, error) {
 	f := strings.Fields(line)
 	if len(f) != 3 {
@@ -56,18 +59,19 @@ func (sm StyleMap) parseEntry(line string) (StyleEntry, error) {
 	if err != nil {
 		return StyleEntry{}, fmt.Errorf("bad start: %v", err)
 	}
-	length, err := strconv.Atoi(f[2])
+	end, err := strconv.Atoi(f[2])
 	if err != nil {
-		return StyleEntry{}, fmt.Errorf("bad length: %v", err)
+		return StyleEntry{}, fmt.Errorf("bad end: %v", err)
 	}
-	return StyleEntry{Idx: idx, Start: start, Length: length}, nil
+	return StyleEntry{Idx: idx, Start: start, End: end}, nil
 }
 
-// StyleEntry is a (style-index, start-position, length) triple.
+// StyleEntry is a (style-index, start-rune, end-rune) triple.
+// Start is inclusive, End is exclusive — mirroring acme's event coordinates.
 type StyleEntry struct {
-	Idx    int
-	Start  int
-	Length int
+	Idx   int
+	Start int
+	End   int // exclusive
 }
 
 // Layer is a named collection of style entries.
@@ -133,7 +137,7 @@ func (w *WinState) styleText(layID int) string {
 		if l.ID == layID {
 			var sb strings.Builder
 			for _, e := range l.Entries {
-				fmt.Fprintf(&sb, "%d %d %d\n", e.Idx, e.Start, e.Length)
+				fmt.Fprintf(&sb, "%d %d %d\n", e.Idx, e.Start, e.End)
 			}
 			return sb.String()
 		}
@@ -161,8 +165,9 @@ func (ws *WinState) insertAt(q0, n int) {
 			e := &l.Entries[i]
 			if q0 <= e.Start {
 				e.Start += n
-			} else if q0 < e.Start+e.Length {
-				e.Length += n
+				e.End += n
+			} else if q0 < e.End {
+				e.End += n
 			}
 		}
 	}
@@ -176,33 +181,41 @@ func (ws *WinState) deleteRange(q0, q1 int) {
 	for _, l := range ws.layers {
 		out := l.Entries[:0]
 		for _, e := range l.Entries {
-			eEnd := e.Start + e.Length
-			if eEnd <= q0 {
+			if e.End <= q0 {
+				// Entirely before deletion: keep as-is.
 				out = append(out, e)
 				continue
 			}
 			if e.Start >= q1 {
+				// Entirely after deletion: shift left.
 				e.Start -= n
+				e.End -= n
 				out = append(out, e)
 				continue
 			}
-			// Overlap: retain the parts before q0 and after q1.
-			before := 0
-			if e.Start < q0 {
-				before = q0 - e.Start
+			// Overlaps the deleted range: clamp to surviving portions.
+			newStart := e.Start
+			if newStart > q0 {
+				newStart = q0
 			}
-			after := 0
-			if eEnd > q1 {
-				after = eEnd - q1
+			newEnd := e.End
+			if newEnd < q1 {
+				newEnd = q1
 			}
-			if newLen := before + after; newLen > 0 {
-				newStart := e.Start
-				if newStart > q0 {
-					newStart = q0
-				}
-				out = append(out, StyleEntry{Idx: e.Idx, Start: newStart, Length: newLen})
+			// Shrink by the overlap with [q0, q1).
+			overlapStart := e.Start
+			if overlapStart < q0 {
+				overlapStart = q0
 			}
-			// If newLen == 0 the entry is entirely inside the deleted range; discard it.
+			overlapEnd := e.End
+			if overlapEnd > q1 {
+				overlapEnd = q1
+			}
+			shrink := overlapEnd - overlapStart
+			newEnd -= shrink
+			if newEnd > newStart {
+				out = append(out, StyleEntry{Idx: e.Idx, Start: newStart, End: newEnd})
+			}
 		}
 		l.Entries = out
 	}
@@ -221,17 +234,17 @@ func (w *WinState) clearLayer(layID int) {
 	w.mu.Unlock()
 }
 
-// flushLayer composes all layers and writes the result to acme's ctl.
+// flushLayer composes all layers and writes the result to acme's style file.
 // Called at fid clunk for write-mode ftClear and ftStyle fids so that
-// each Apply or Clear issues exactly one ctl write (one winframesync).
+// each Apply or Clear issues exactly one write (one winframesync).
 func (w *WinState) flushLayer() {
 	w.mu.Lock()
 	snapshot := append([]*Layer(nil), w.layers...)
 	w.mu.Unlock()
-	w.writeCtl(compose(snapshot))
+	w.writeStyle(compose(snapshot))
 }
 
-// parseStyleWrite processes accumulated write bytes for a style file.
+// parseStyleWrite processes accumulated write bytes for a layer style file.
 // Complete lines are parsed and added to the layer; incomplete lines
 // remain in *wbuf for the next write.
 func (w *WinState) parseStyleWrite(layID int, wbuf *[]byte, sm StyleMap) error {
@@ -266,34 +279,43 @@ func (w *WinState) parseStyleWrite(layID int, wbuf *[]byte, sm StyleMap) error {
 		}
 	}
 	w.mu.Unlock()
-	// writeCtl is deferred to flushLayer at fid clunk.
+	// writeStyle is deferred to flushLayer at fid clunk.
 	return nil
 }
 
-// writeCtl writes the composed style to the acme window's ctl file using a
-// single "style 0 idx s l …" command.  The leading 0 tells ctlstyleparse to
-// atomically clear all existing styles and apply the new entries in one
-// winframesync call, eliminating the intermediate "no style" flash that two
-// separate writes (clear + entries) would cause.
-func (w *WinState) writeCtl(entries []StyleEntry) {
-	win, err := acme.Open(w.ID, nil)
+// writeStyle writes the composed style to acme's <winid>/style file.
+//
+// Opening the file with OWRITE clears acme's in-memory style at open time;
+// writing "idx start end\n" lines populates the new set; closing triggers
+// xfidstyleflush → winreplacestyles → winframesync — exactly one repaint.
+//
+// Using a dedicated file instead of the ctl command means no chunking,
+// no special "style 0 …" combined syntax, and no size limit from iounit
+// (each Write call is independent; the file accumulates in acme until close).
+func (w *WinState) writeStyle(entries []StyleEntry) {
+	// Mount acme fresh per call so we survive acme restarts.
+	fs, err := client.MountService("acme")
+	if err != nil {
+		return // acme not running or not reachable
+	}
+	defer fs.Close()
+
+	// Open <winid>/style for write — this clears at open.
+	fid, err := fs.Open(fmt.Sprintf("%d/style", w.ID), plan9.OWRITE)
 	if err != nil {
 		return // window may be gone
 	}
-	defer win.CloseFiles()
+	defer fid.Close()
 
 	if len(entries) == 0 {
-		win.Ctl("style 0") //nolint:errcheck
-		return
+		return // clunk with no writes → empty flush → winframesync with no styles
 	}
 
-	// Build "style 0 idx1 s1 l1 idx2 s2 l2 …" — one ctl write, one winframesync.
 	var sb strings.Builder
-	sb.WriteString("style 0")
 	for _, e := range entries {
-		fmt.Fprintf(&sb, " %d %d %d", e.Idx, e.Start, e.Length)
+		fmt.Fprintf(&sb, "%d %d %d\n", e.Idx, e.Start, e.End)
 	}
-	win.Ctl(sb.String()) //nolint:errcheck
+	fid.Write([]byte(sb.String())) //nolint:errcheck
 }
 
 // compose merges all layers into a sorted, non-overlapping slice.
@@ -308,11 +330,11 @@ func compose(layers []*Layer) []StyleEntry {
 	var events []event
 	for li, l := range layers {
 		for _, e := range l.Entries {
-			if e.Idx == 0 || e.Length <= 0 {
+			if e.Idx == 0 || e.End <= e.Start {
 				continue
 			}
 			events = append(events, event{e.Start, li, e.Idx, false})
-			events = append(events, event{e.Start + e.Length, li, 0, true})
+			events = append(events, event{e.End, li, 0, true})
 		}
 	}
 	if len(events) == 0 {
@@ -347,7 +369,7 @@ func compose(layers []*Layer) []StyleEntry {
 	for i < len(events) {
 		pos := events[i].pos
 		if pos > curPos && curStyle != 0 {
-			result = append(result, StyleEntry{curStyle, curPos, pos - curPos})
+			result = append(result, StyleEntry{Idx: curStyle, Start: curPos, End: pos})
 		}
 		for i < len(events) && events[i].pos == pos {
 			ev := events[i]
@@ -405,3 +427,5 @@ func (s *Server) winIDs() []int {
 	sort.Ints(ids)
 	return ids
 }
+
+

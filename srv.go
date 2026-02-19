@@ -463,7 +463,7 @@ func (cn *conn) doClunk(fc *plan9.Fcall) *plan9.Fcall {
 		mode := f.mode & 3
 		isWrite := mode == plan9.OWRITE || mode == plan9.ORDWR
 		if isWrite && (f.ft == ftClear || f.ft == ftStyle) {
-			// One writeCtl per fid lifetime: flush now that all writes are done.
+			// One writeStyle per fid lifetime: flush now that all writes are done.
 			w := cn.srv.getWin(f.winID)
 			if w != nil {
 				w.flushLayer()
