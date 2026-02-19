@@ -208,7 +208,8 @@ func (ws *WinState) deleteRange(q0, q1 int) {
 	}
 }
 
-// clearLayer removes all entries from the given layer and recomposes.
+// clearLayer removes all entries from the given layer.
+// Does NOT call writeCtl; that is deferred to flushLayer (called at fid clunk).
 func (w *WinState) clearLayer(layID int) {
 	w.mu.Lock()
 	for _, l := range w.layers {
@@ -217,6 +218,14 @@ func (w *WinState) clearLayer(layID int) {
 			break
 		}
 	}
+	w.mu.Unlock()
+}
+
+// flushLayer composes all layers and writes the result to acme's ctl.
+// Called at fid clunk for write-mode ftClear and ftStyle fids so that
+// each Apply or Clear issues exactly one ctl write (one winframesync).
+func (w *WinState) flushLayer() {
+	w.mu.Lock()
 	snapshot := append([]*Layer(nil), w.layers...)
 	w.mu.Unlock()
 	w.writeCtl(compose(snapshot))
@@ -256,14 +265,16 @@ func (w *WinState) parseStyleWrite(layID int, wbuf *[]byte, sm StyleMap) error {
 			break
 		}
 	}
-	snapshot := append([]*Layer(nil), w.layers...)
 	w.mu.Unlock()
-	w.writeCtl(compose(snapshot))
+	// writeCtl is deferred to flushLayer at fid clunk.
 	return nil
 }
 
-// writeCtl writes the composed style to the acme window's ctl file.
-// "style 0" clears acme's single layer; subsequent "style" commands fill it.
+// writeCtl writes the composed style to the acme window's ctl file using a
+// single "style 0 idx s l …" command.  The leading 0 tells ctlstyleparse to
+// atomically clear all existing styles and apply the new entries in one
+// winframesync call, eliminating the intermediate "no style" flash that two
+// separate writes (clear + entries) would cause.
 func (w *WinState) writeCtl(entries []StyleEntry) {
 	win, err := acme.Open(w.ID, nil)
 	if err != nil {
@@ -271,26 +282,18 @@ func (w *WinState) writeCtl(entries []StyleEntry) {
 	}
 	defer win.CloseFiles()
 
-	if err := win.Ctl("style 0"); err != nil {
+	if len(entries) == 0 {
+		win.Ctl("style 0") //nolint:errcheck
 		return
 	}
 
-	// Write in chunks to stay well within the iounit.
-	const chunk = 200
-	for i := 0; i < len(entries); i += chunk {
-		end := i + chunk
-		if end > len(entries) {
-			end = len(entries)
-		}
-		var sb strings.Builder
-		sb.WriteString("style")
-		for _, e := range entries[i:end] {
-			fmt.Fprintf(&sb, " %d %d %d", e.Idx, e.Start, e.Length)
-		}
-		if err := win.Ctl("%s", sb.String()); err != nil {
-			return
-		}
+	// Build "style 0 idx1 s1 l1 idx2 s2 l2 …" — one ctl write, one winframesync.
+	var sb strings.Builder
+	sb.WriteString("style 0")
+	for _, e := range entries {
+		fmt.Fprintf(&sb, " %d %d %d", e.Idx, e.Start, e.Length)
 	}
+	win.Ctl(sb.String()) //nolint:errcheck
 }
 
 // compose merges all layers into a sorted, non-overlapping slice.
