@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
+	"9fans.net/go/plan9/client"
 )
 
 // Sentinel walk errors.
@@ -25,11 +26,7 @@ func main() {
 
 	srvPath := *srv
 	if srvPath == "" {
-		ns := os.Getenv("NAMESPACE")
-		if ns == "" {
-			log.Fatal("$NAMESPACE not set; use --srv to specify socket path")
-		}
-		srvPath = ns + "/acme-styles"
+		srvPath = client.Namespace() + "/acme-styles"
 	}
 
 	sm := StyleMap{}
