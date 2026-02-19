@@ -173,7 +173,15 @@ func (ws *WinState) insertAt(q0, n int) {
 	}
 }
 
-// deleteRange shrinks all layer entry positions after characters [q0,q1) are removed.
+// deleteRange shrinks all layer entry positions after characters [q0,q1) are
+// removed.  There are six cases:
+//
+//   1. e.End <= q0                  → entirely before, keep
+//   2. e.Start >= q1                → entirely after, shift left by n
+//   3. e.Start < q0 && e.End > q1  → straddles both ends: [s, se-n)
+//   4. e.Start < q0 && e.End <= q1 → right end deleted: keep [s, q0)
+//   5. e.Start >= q0 && e.End > q1 → left start deleted: keep [q0, se-n)
+//   6. e.Start >= q0 && e.End <= q1 → completely inside, discard
 func (ws *WinState) deleteRange(q0, q1 int) {
 	n := q1 - q0
 	ws.mu.Lock()
@@ -181,40 +189,25 @@ func (ws *WinState) deleteRange(q0, q1 int) {
 	for _, l := range ws.layers {
 		out := l.Entries[:0]
 		for _, e := range l.Entries {
-			if e.End <= q0 {
-				// Entirely before deletion: keep as-is.
+			switch {
+			case e.End <= q0:
+				// Case 1: entirely before.
 				out = append(out, e)
-				continue
-			}
-			if e.Start >= q1 {
-				// Entirely after deletion: shift left.
-				e.Start -= n
-				e.End -= n
-				out = append(out, e)
-				continue
-			}
-			// Overlaps the deleted range: clamp to surviving portions.
-			newStart := e.Start
-			if newStart > q0 {
-				newStart = q0
-			}
-			newEnd := e.End
-			if newEnd < q1 {
-				newEnd = q1
-			}
-			// Shrink by the overlap with [q0, q1).
-			overlapStart := e.Start
-			if overlapStart < q0 {
-				overlapStart = q0
-			}
-			overlapEnd := e.End
-			if overlapEnd > q1 {
-				overlapEnd = q1
-			}
-			shrink := overlapEnd - overlapStart
-			newEnd -= shrink
-			if newEnd > newStart {
-				out = append(out, StyleEntry{Idx: e.Idx, Start: newStart, End: newEnd})
+			case e.Start >= q1:
+				// Case 2: entirely after → shift left.
+				out = append(out, StyleEntry{e.Idx, e.Start - n, e.End - n})
+			case e.Start < q0 && e.End > q1:
+				// Case 3: straddles both ends; middle deleted.
+				out = append(out, StyleEntry{e.Idx, e.Start, e.End - n})
+			case e.Start < q0:
+				// Case 4: right end in deletion zone; keep left part.
+				if q0 > e.Start {
+					out = append(out, StyleEntry{e.Idx, e.Start, q0})
+				}
+			case e.End > q1:
+				// Case 5: left start in deletion zone; keep right part shifted.
+				out = append(out, StyleEntry{e.Idx, q0, e.End - n})
+			// Case 6: completely inside deletion → discard (no append).
 			}
 		}
 		l.Entries = out
