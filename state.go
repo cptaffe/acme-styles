@@ -215,7 +215,7 @@ func (ws *WinState) deleteRange(q0, q1 int) {
 }
 
 // clearLayer removes all entries from the given layer.
-// Does NOT call writeCtl; that is deferred to flushLayer (called at fid clunk).
+// Does NOT call writeStyle; that is deferred to flushLayer (called at fid clunk).
 func (w *WinState) clearLayer(layID int) {
 	w.mu.Lock()
 	for _, l := range w.layers {
