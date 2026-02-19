@@ -152,6 +152,62 @@ func (w *WinState) setLayerName(layID int, name string) {
 	}
 }
 
+// insertAt shifts all layer entry positions after n characters inserted at q0.
+func (ws *WinState) insertAt(q0, n int) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	for _, l := range ws.layers {
+		for i := range l.Entries {
+			e := &l.Entries[i]
+			if q0 <= e.Start {
+				e.Start += n
+			} else if q0 < e.Start+e.Length {
+				e.Length += n
+			}
+		}
+	}
+}
+
+// deleteRange shrinks all layer entry positions after characters [q0,q1) are removed.
+func (ws *WinState) deleteRange(q0, q1 int) {
+	n := q1 - q0
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	for _, l := range ws.layers {
+		out := l.Entries[:0]
+		for _, e := range l.Entries {
+			eEnd := e.Start + e.Length
+			if eEnd <= q0 {
+				out = append(out, e)
+				continue
+			}
+			if e.Start >= q1 {
+				e.Start -= n
+				out = append(out, e)
+				continue
+			}
+			// Overlap: retain the parts before q0 and after q1.
+			before := 0
+			if e.Start < q0 {
+				before = q0 - e.Start
+			}
+			after := 0
+			if eEnd > q1 {
+				after = eEnd - q1
+			}
+			if newLen := before + after; newLen > 0 {
+				newStart := e.Start
+				if newStart > q0 {
+					newStart = q0
+				}
+				out = append(out, StyleEntry{Idx: e.Idx, Start: newStart, Length: newLen})
+			}
+			// If newLen == 0 the entry is entirely inside the deleted range; discard it.
+		}
+		l.Entries = out
+	}
+}
+
 // clearLayer removes all entries from the given layer and recomposes.
 func (w *WinState) clearLayer(layID int) {
 	w.mu.Lock()

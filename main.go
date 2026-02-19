@@ -70,6 +70,7 @@ func watchLog(s *Server) {
 	}
 	for _, w := range wins {
 		s.addWin(w.ID)
+		go watchWindow(s, w.ID)
 	}
 
 	lr, err := acme.Log()
@@ -84,8 +85,38 @@ func watchLog(s *Server) {
 		switch ev.Op {
 		case "new":
 			s.addWin(ev.ID)
+			go watchWindow(s, ev.ID)
 		case "del":
 			s.delWin(ev.ID)
 		}
+	}
+}
+
+// watchWindow opens the event file for the given acme window and tracks body
+// insertions and deletions so that layer entry positions stay correct between
+// LSP token updates.  All events are written back so editing proceeds normally.
+func watchWindow(s *Server, id int) {
+	win, err := acme.Open(id, nil)
+	if err != nil {
+		return
+	}
+	defer win.CloseFiles()
+	if err := win.OpenEvent(); err != nil {
+		return
+	}
+	for {
+		ev, err := win.ReadEvent()
+		if err != nil {
+			return // window gone or acme exiting
+		}
+		if ws := s.getWin(id); ws != nil {
+			switch ev.C2 {
+			case 'I':
+				ws.insertAt(ev.Q0, ev.Nr)
+			case 'D':
+				ws.deleteRange(ev.Q0, ev.Q1)
+			}
+		}
+		win.WriteEvent(ev) //nolint:errcheck
 	}
 }
