@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"9fans.net/go/plan9"
+	"github.com/cptaffe/acme-styles/logger"
+	"go.uber.org/zap"
 )
 
 // File-type constants; encode directly into Qid.Path.
@@ -108,10 +110,9 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 		if err != nil {
 			return 0, 0, 0, ErrNoFile
 		}
-		// Create a WinState on demand so windows that were already open when
-		// acme-styles started (and thus missed the log "new" event) can still
-		// have layers allocated for them.
-		s.addWin(id)
+		// Accept any numeric window ID.  WinStates are created by watchLog;
+		// operations that need the state (NewLayer, etc.) check getWin and
+		// return "window gone" if it has not been registered yet.
 		return ftWinDir, id, 0, nil
 	case ftWinDir:
 		if name == "layers" {
@@ -217,6 +218,7 @@ type conn struct {
 
 func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
+	log := logger.L(s.ctx)
 	cn := &conn{
 		srv:         s,
 		fids:        make(map[uint32]*fid),
@@ -228,7 +230,13 @@ func (s *Server) handleConn(c net.Conn) {
 		if err != nil {
 			return
 		}
+		start := time.Now()
 		resp := cn.dispatch(fc)
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			log.Warn("slow dispatch",
+				zap.String("type", fcallTypeName(fc.Type)),
+				zap.Duration("elapsed", elapsed))
+		}
 		if err := plan9.WriteFcall(c, resp); err != nil {
 			return
 		}
@@ -548,4 +556,37 @@ func (cn *conn) doStat(fc *plan9.Fcall) *plan9.Fcall {
 		return rerr(fc.Tag, err.Error())
 	}
 	return &plan9.Fcall{Type: plan9.Rstat, Tag: fc.Tag, Stat: stat}
+}
+
+func fcallTypeName(t uint8) string {
+	switch t {
+	case plan9.Tversion:
+		return "Tversion"
+	case plan9.Tauth:
+		return "Tauth"
+	case plan9.Tattach:
+		return "Tattach"
+	case plan9.Tflush:
+		return "Tflush"
+	case plan9.Twalk:
+		return "Twalk"
+	case plan9.Topen:
+		return "Topen"
+	case plan9.Tcreate:
+		return "Tcreate"
+	case plan9.Tread:
+		return "Tread"
+	case plan9.Twrite:
+		return "Twrite"
+	case plan9.Tclunk:
+		return "Tclunk"
+	case plan9.Tremove:
+		return "Tremove"
+	case plan9.Tstat:
+		return "Tstat"
+	case plan9.Twstat:
+		return "Twstat"
+	default:
+		return fmt.Sprintf("T%d", t)
+	}
 }

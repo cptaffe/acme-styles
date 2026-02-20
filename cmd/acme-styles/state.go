@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
+	"9fans.net/go/plan9"
+	"9fans.net/go/plan9/client"
 	"github.com/cptaffe/acme-styles/logger"
 	"go.uber.org/zap"
 )
@@ -85,7 +87,14 @@ func (ws *WinState) submit(fn func(*WinState)) {
 	}
 }
 
-// call enqueues fn and blocks until it has run (or ctx is cancelled).
+// callTimeout is the maximum time call() will wait for the window goroutine
+// to process a closure.  This guards 9P handlers against an unresponsive
+// run() goroutine (e.g. one stuck in a slow 9P call at startup).
+const callTimeout = 5 * time.Second
+
+// call enqueues fn and blocks until it has run, ctx is cancelled, or
+// callTimeout elapses.  Callers should treat zero/nil return values from
+// captured variables as indicating that the call did not complete.
 func (ws *WinState) call(fn func(*WinState)) {
 	done := make(chan struct{})
 	ws.submit(func(ws *WinState) {
@@ -95,6 +104,8 @@ func (ws *WinState) call(fn func(*WinState)) {
 	select {
 	case <-done:
 	case <-ws.ctx.Done():
+	case <-time.After(callTimeout):
+		logger.L(ws.ctx).Warn("call timed out; window goroutine unresponsive")
 	}
 }
 
@@ -109,17 +120,19 @@ func (ws *WinState) run() {
 
 	// Clear any stale styles from a previous acme-styles run.
 	if ws.win != nil {
+		log.Debug("clearing stale styles")
 		if err := ws.win.Style(nil); err != nil {
 			log.Error("clear style", zap.Error(err))
 		}
+		log.Debug("cleared stale styles")
 	}
 
-	// Edit tracking: window goroutine reads the log channel directly so no
-	// separate watchWindow goroutine is needed.
-	var editCh <-chan *acme.WinLogEvent
-	if ws.win != nil {
-		editCh = ws.win.LogChan()
-	}
+	// Edit tracking: open id/log on the dedicated logFsys so that long-polling
+	// Tread calls do not share the muxer with short-lived Style/Addr writes.
+	log.Debug("opening log chan")
+	editCh := ws.startLogChan()
+	log.Debug("opened log chan", zap.Bool("ok", editCh != nil))
+	log.Debug("entering select loop")
 
 	for {
 		select {
@@ -155,6 +168,43 @@ func (ws *WinState) run() {
 			return
 		}
 	}
+}
+
+// startLogChan opens id/log on the server's dedicated log connection and
+// returns a channel that delivers edit events.  The goroutine exits when the
+// fid is closed (acme deleted the window) or ctx is cancelled.
+//
+// Using a separate Fsys for log reads prevents the long-polling Tread from
+// holding the shared-fsys muxer and stalling Style/Addr writes.
+func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
+	log := logger.L(ws.ctx)
+	if ws.srv.logFsys == nil {
+		return nil
+	}
+	log.Debug("opening log fid")
+	fid, err := ws.srv.logFsys.Open(fmt.Sprintf("%d/log", ws.ID), plan9.OREAD)
+	if err != nil {
+		log.Error("open log", zap.Error(err))
+		return nil
+	}
+	log.Debug("opened log fid")
+	ch := make(chan *acme.WinLogEvent)
+	go func() {
+		defer fid.Close()
+		defer close(ch)
+		for {
+			e, err := acme.ReadLog(fid)
+			if err != nil {
+				return
+			}
+			select {
+			case ch <- e:
+			case <-ws.ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 // ---- internal goroutine-owned helpers ----
@@ -404,16 +454,23 @@ type Server struct {
 	masterPalette []PaletteEntry
 	layerOrder    []string
 
+	// logFsys is a dedicated acme connection used exclusively for per-window
+	// long-polling Tread calls on id/log.  Keeping log reads on a separate
+	// connection prevents them from holding the shared-fsys muxer and blocking
+	// short-lived Style/Addr calls.
+	logFsys *client.Fsys
+
 	mu   sync.Mutex
 	wins map[int]*WinState
 	ctx  context.Context // root context; cancelled on shutdown
 	wg   sync.WaitGroup  // tracks live window goroutines
 }
 
-func newServer(cfg Config, ctx context.Context) *Server {
+func newServer(cfg Config, logFsys *client.Fsys, ctx context.Context) *Server {
 	return &Server{
 		masterPalette: cfg.Palette,
 		layerOrder:    cfg.LayerOrder,
+		logFsys:       logFsys,
 		wins:          make(map[int]*WinState),
 		ctx:           ctx,
 	}
@@ -437,11 +494,13 @@ func (s *Server) addWin(id int) *WinState {
 	ctx, cancel := context.WithCancel(s.ctx)
 	ctx = logger.NewContext(ctx, logger.L(s.ctx).With(zap.Int("window", id)))
 
+	logger.L(ctx).Debug("opening acme window")
 	awin, err := acme.Open(id, nil)
 	if err != nil {
 		logger.L(ctx).Error("open acme window", zap.Error(err))
 		// awin is nil; run() handles nil win gracefully.
 	}
+	logger.L(ctx).Debug("opened acme window", zap.Bool("ok", awin != nil))
 
 	ws := &WinState{
 		ID:     id,
