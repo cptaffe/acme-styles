@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"9fans.net/go/acme"
 	"9fans.net/go/plan9/client"
@@ -63,7 +64,23 @@ func main() {
 	defer stop()
 	ctx = logger.NewContext(ctx, l)
 
-	s := newServer(cfg, ctx)
+	// Dedicated connection for log reads: keeps long-polling Tread calls off
+	// the shared acme connection so they can't stall short-lived Style/Addr
+	// writes.  logConn is stored so we can force-close the socket at shutdown,
+	// immediately unblocking all pending Treads.
+	type logMount struct {
+		conn *client.Conn
+		fsys *client.Fsys
+	}
+	lm, err := retryOn(ctx, 10, 200*time.Millisecond, func() (logMount, error) {
+		c, f, err := client.MountServiceConn("acme")
+		return logMount{c, f}, err
+	})
+	if err != nil {
+		l.Fatal("mount acme (log)", zap.Error(err))
+	}
+
+	s := newServer(cfg, lm.conn, lm.fsys, ctx)
 	go watchLog(s)
 
 	os.Remove(srvPath)
@@ -71,69 +88,133 @@ func main() {
 	if err != nil {
 		l.Fatal("listen", zap.String("path", srvPath), zap.Error(err))
 	}
-	defer ln.Close()
 	defer os.Remove(srvPath)
+	defer ln.Close()
+
+	// Close the listener when the context is cancelled so that Accept
+	// returns an error and the loop below can exit.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
 
 	l.Info("listening", zap.String("addr", srvPath))
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
 			l.Error("accept", zap.Error(err))
 			continue
 		}
 		go s.handleConn(c)
 	}
+
+	l.Info("shutting down; waiting for window goroutines")
+	// Force-close the log connection: closes the socket immediately, causing
+	// all pending long-polling Tread calls to fail.  The startLogChan goroutines
+	// exit, close their channels, and run() goroutines see ctx.Done() →
+	// CloseFiles() → wg.Done().
+	s.logConn.Close() //nolint:errcheck
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		l.Info("shutdown complete")
+	case <-time.After(5 * time.Second):
+		l.Warn("shutdown timed out; exiting anyway")
+	}
 }
 
 // watchLog seeds window state from acme and then streams opens/closes.
-// Any failure is fatal — launchd will restart us.
+// Each addWin call starts a window goroutine that clears stale styles and
+// tracks edits; no extra per-window goroutines are needed here.
+//
+// acme.Windows() and acme.Log() are retried with backoff: when the previous
+// process exits abruptly, the 9P proxy (9pserve) may still be sending Tclunk
+// messages for its outstanding fids, leaving acme's fid table temporarily busy.
+// Retrying gives that cleanup time to finish before we give up.
+//
+// lr.Read() is a blocking call; we wrap each call in a goroutine and select
+// against ctx.Done() so that a signal causes a clean exit.  The in-flight
+// goroutine may linger briefly after shutdown — that is fine because the
+// process is about to exit.
 func watchLog(s *Server) {
 	l := logger.L(s.ctx)
-	wins, err := acme.Windows()
+
+	wins, err := retryOn(s.ctx, 10, 200*time.Millisecond, acme.Windows)
 	if err != nil {
 		l.Fatal("acme.Windows", zap.Error(err))
 	}
 	for _, w := range wins {
-		ws := s.addWin(w.ID)
-		if ws != nil {
-			go ws.clearStyle()
-			go watchWindow(ws)
-		}
+		s.addWin(w.ID)
 	}
 
-	lr, err := acme.Log()
+	lr, err := retryOn(s.ctx, 10, 200*time.Millisecond, acme.Log)
 	if err != nil {
 		l.Fatal("acme.Log", zap.Error(err))
 	}
+	defer lr.Close()
+
+	type logResult struct {
+		ev  acme.LogEvent
+		err error
+	}
+	ch := make(chan logResult, 1)
+
+	readNext := func() {
+		go func() {
+			ev, err := lr.Read()
+			ch <- logResult{ev, err}
+		}()
+	}
+	readNext()
+
 	for {
-		ev, err := lr.Read()
-		if err != nil {
-			l.Fatal("acme log", zap.Error(err))
-		}
-		switch ev.Op {
-		case "new":
-			if ws := s.addWin(ev.ID); ws != nil {
-				go watchWindow(ws)
+		select {
+		case <-s.ctx.Done():
+			return
+		case res := <-ch:
+			if res.err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				l.Fatal("acme log", zap.Error(res.err))
 			}
-		case "del":
-			s.delWin(ev.ID)
+			switch res.ev.Op {
+			case "new":
+				s.addWin(res.ev.ID)
+			case "del":
+				s.delWin(res.ev.ID)
+			}
+			readNext()
 		}
 	}
 }
 
-// watchWindow reads ws.win's log channel and tracks body insertions and
-// deletions so that all layer run positions stay correct between style updates.
-func watchWindow(ws *WinState) {
-	if ws.win == nil {
-		return
-	}
-	for e := range ws.win.LogChan() {
-		switch e.Op {
-		case 'I':
-			ws.insertAt(e.Q0, e.Q1)
-		case 'D':
-			ws.deleteRange(e.Q0, e.Q1)
+// retryOn calls fn repeatedly until it succeeds, the context is cancelled,
+// or maxAttempts is exhausted.  Between each attempt it waits delay.
+func retryOn[T any](ctx context.Context, maxAttempts int, delay time.Duration, fn func() (T, error)) (T, error) {
+	var (
+		zero T
+		err  error
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var v T
+		v, err = fn()
+		if err == nil {
+			return v, nil
+		}
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(delay):
 		}
 	}
+	return zero, err
 }

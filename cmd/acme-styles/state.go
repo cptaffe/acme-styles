@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -11,6 +10,8 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
+	"9fans.net/go/plan9"
+	"9fans.net/go/plan9/client"
 	"github.com/cptaffe/acme-styles/logger"
 	"go.uber.org/zap"
 )
@@ -36,47 +37,405 @@ type StyleRun struct {
 
 // Layer is a named collection of palette entries and style runs.
 type Layer struct {
-	ID       int
-	Name     string
-	Priority int // higher value wins in composition; default 0
-	Palette  []PaletteEntry
-	Runs     []StyleRun
+	ID      int
+	Name    string
+	Palette []PaletteEntry
+	Runs    []StyleRun
 }
 
-// coalesceDelay is the window during which multiple flushLayer calls are
-// batched into a single write to acme.  Multiple tools (lsp, treesitter)
-// often flush within milliseconds of each other; coalescing prevents
-// redundant winframesync calls in acme.
+// coalesceDelay is the window during which multiple flush triggers are batched
+// into a single write to acme.
 const coalesceDelay = 20 * time.Millisecond
 
-// flushMsg carries a composed palette+run result from flushLayer to the
-// per-window flusher goroutine.
+// flushMsg is a composed palette+run result waiting to be written to acme.
 type flushMsg struct {
 	pal  []PaletteEntry
 	runs []StyleRun
 }
 
-// WinState holds all layers for one acme window.
+// WinState is the actor for one acme window.
+//
+// The fields ID, ctx, cancel, cmdCh, and srv are set once at construction and
+// may be read from any goroutine without a lock.
+//
+// All remaining fields (win, layers, nextID, prevPalette, prevRuns, pending,
+// flushTimer) are owned exclusively by the run() goroutine and must not be
+// accessed from any other goroutine.
 type WinState struct {
 	ID     int
-	mu     sync.Mutex
-	layers []*Layer
-	nextID int
-	// win is the acme window handle used for Addr and Style writes.
-	win *acme.Win
-	// prevPalette and prevRuns are the last composition result written to acme.
-	// They are kept in sync with body edits via insertAt/deleteRange so that
-	// diffRuns can produce tight dirty intervals.  Protected by mu.
-	prevPalette []PaletteEntry
-	prevRuns    []StyleRun
-	// flushCh delivers new compositions to the flusher goroutine.
-	// Buffered so flushLayer never blocks in the common case.
-	flushCh chan flushMsg
-	// ctx/cancel are the per-window context; cancel stops the flusher when
-	// the window closes or the server shuts down.
 	ctx    context.Context
 	cancel context.CancelFunc
+	cmdCh  chan func(*WinState)
+	srv    *Server
+
+	// Owned by run() — do not access from other goroutines.
+	win         *acme.Win
+	layers      []*Layer
+	nextID      int
+	prevPalette []PaletteEntry
+	prevRuns    []StyleRun
+	pending     *flushMsg
+	flushTimer  *time.Timer
 }
+
+// submit enqueues fn to run in the window's goroutine.  Returns immediately;
+// fn runs asynchronously.  Drops the fn silently if ctx is already cancelled.
+func (ws *WinState) submit(fn func(*WinState)) {
+	select {
+	case ws.cmdCh <- fn:
+	case <-ws.ctx.Done():
+	}
+}
+
+// callTimeout is the maximum time call() will wait for the window goroutine
+// to process a closure.  This guards 9P handlers against an unresponsive
+// run() goroutine (e.g. one stuck in a slow 9P call at startup).
+const callTimeout = 5 * time.Second
+
+// call enqueues fn and blocks until it has run, ctx is cancelled, or
+// callTimeout elapses.  Callers should treat zero/nil return values from
+// captured variables as indicating that the call did not complete.
+func (ws *WinState) call(fn func(*WinState)) {
+	done := make(chan struct{})
+	ws.submit(func(ws *WinState) {
+		fn(ws)
+		close(done)
+	})
+	select {
+	case <-done:
+	case <-ws.ctx.Done():
+	case <-time.After(callTimeout):
+		logger.L(ws.ctx).Warn("call timed out; window goroutine unresponsive")
+	}
+}
+
+// run is the window goroutine.  It owns all mutable WinState fields and is
+// the only goroutine that touches them.
+func (ws *WinState) run() {
+	defer ws.srv.wg.Done()
+	log := logger.L(ws.ctx)
+
+	ws.flushTimer = time.NewTimer(coalesceDelay)
+	ws.flushTimer.Stop()
+
+	// Clear any stale styles from a previous acme-styles run.
+	if ws.win != nil {
+		log.Debug("clearing stale styles")
+		if err := ws.win.Style(nil); err != nil {
+			log.Error("clear style", zap.Error(err))
+		}
+		log.Debug("cleared stale styles")
+	}
+
+	// Edit tracking: open id/log on its own per-window MountService connection
+	// in a background goroutine so that run() enters the select loop
+	// immediately and stays responsive to call(fn) while the mount/open is in
+	// progress.  Using a per-window connection avoids the 9pserve MAXMSG=64
+	// limit: with N windows doing long-polling Tread on a shared connection,
+	// there are only (64-N) slots left for new opens.  Per-window connections
+	// each carry exactly one Tread at steady state.
+	log.Debug("opening log chan")
+	logChanCh := make(chan (<-chan *acme.WinLogEvent), 1)
+	go func() { logChanCh <- ws.startLogChan() }()
+
+	var editCh <-chan *acme.WinLogEvent
+	log.Debug("entering select loop")
+
+	for {
+		select {
+		case ch := <-logChanCh:
+			editCh = ch
+			logChanCh = nil // stop selecting; nil channel blocks forever
+			log.Debug("opened log chan", zap.Bool("ok", editCh != nil))
+
+		case fn := <-ws.cmdCh:
+			fn(ws)
+
+		case e, ok := <-editCh:
+			if !ok {
+				// Log file closed — window will be deleted shortly via the
+				// global acme log.  Stop tracking edits; keep running so that
+				// in-flight commands still execute.
+				editCh = nil
+				continue
+			}
+			switch e.Op {
+			case 'I':
+				ws.applyInsert(e.Q0, e.Q1)
+			case 'D':
+				ws.applyDelete(e.Q0, e.Q1)
+			}
+
+		case <-ws.flushTimer.C:
+			if ws.pending != nil {
+				ws.doFlush()
+			}
+
+		case <-ws.ctx.Done():
+			ws.flushTimer.Stop()
+			if ws.win != nil {
+				ws.win.CloseFiles()
+				ws.win = nil
+			}
+			return
+		}
+	}
+}
+
+// startLogChan opens id/log on the server's dedicated log connection and
+// returns a channel that delivers edit events.  The goroutine exits when the
+// fid returns an error (e.g. because logConn was force-closed at shutdown) or
+// ctx is cancelled.
+func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
+	log := logger.L(ws.ctx)
+	log.Debug("opening log fid")
+	fid, err := ws.srv.logFsys.Open(fmt.Sprintf("%d/log", ws.ID), plan9.OREAD)
+	if err != nil {
+		log.Error("open log", zap.Error(err))
+		return nil
+	}
+	log.Debug("opened log fid")
+	ch := make(chan *acme.WinLogEvent)
+	go func() {
+		defer fid.Close()
+		defer close(ch)
+		for {
+			e, err := acme.ReadLog(fid)
+			if err != nil {
+				return
+			}
+			select {
+			case ch <- e:
+			case <-ws.ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// ---- internal goroutine-owned helpers ----
+
+func (ws *WinState) applyInsert(q0, n int) {
+	for _, l := range ws.layers {
+		adjustRunsInsert(l.Runs, q0, n)
+	}
+	adjustRunsInsert(ws.prevRuns, q0, n)
+}
+
+func (ws *WinState) applyDelete(q0, q1 int) {
+	for _, l := range ws.layers {
+		l.Runs = adjustRunsDelete(l.Runs, q0, q1)
+	}
+	ws.prevRuns = adjustRunsDelete(ws.prevRuns, q0, q1)
+}
+
+// scheduleFlush recomposes all layers and arms the coalesce timer.
+// Must be called from within the window goroutine.
+func (ws *WinState) scheduleFlush() {
+	newPalette, newRuns := compose(ws.srv.masterPalette, ws.srv.layerOrder, ws.layers)
+	ws.pending = &flushMsg{newPalette, newRuns}
+	resetTimer(ws.flushTimer, coalesceDelay)
+}
+
+// doFlush writes the pending composition to acme and clears ws.pending.
+// Must be called from within the window goroutine.
+func (ws *WinState) doFlush() {
+	if ws.pending == nil {
+		return
+	}
+	ws.diffAndWrite(ws.prevPalette, ws.pending.pal, ws.prevRuns, ws.pending.runs)
+	ws.prevPalette = ws.pending.pal
+	ws.prevRuns = ws.pending.runs
+	ws.pending = nil
+}
+
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// ---- public API for 9P handlers (safe to call from any goroutine) ----
+
+// NewLayer allocates a new layer and returns its ID.
+func (ws *WinState) NewLayer() int {
+	var id int
+	ws.call(func(ws *WinState) {
+		l := &Layer{ID: ws.nextID, Name: strconv.Itoa(ws.nextID)}
+		ws.layers = append(ws.layers, l)
+		id = ws.nextID
+		ws.nextID++
+	})
+	return id
+}
+
+// LayerExists reports whether a layer with the given ID is present.
+func (ws *WinState) LayerExists(id int) bool {
+	var exists bool
+	ws.call(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == id {
+				exists = true
+				return
+			}
+		}
+	})
+	return exists
+}
+
+// LayerIDs returns the IDs of all layers in ascending order.
+func (ws *WinState) LayerIDs() []int {
+	var ids []int
+	ws.call(func(ws *WinState) {
+		ids = make([]int, 0, len(ws.layers))
+		for _, l := range ws.layers {
+			ids = append(ids, l.ID)
+		}
+		sort.Ints(ids)
+	})
+	return ids
+}
+
+// IndexText returns the content of the layers/index file.
+func (ws *WinState) IndexText() string {
+	var result string
+	ws.call(func(ws *WinState) {
+		var sb strings.Builder
+		for _, l := range ws.layers {
+			fmt.Fprintf(&sb, "%d %s\n", l.ID, l.Name)
+		}
+		result = sb.String()
+	})
+	return result
+}
+
+// StyleText returns the serialized palette+runs for one layer.
+func (ws *WinState) StyleText(layID int) string {
+	var result string
+	ws.call(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				result = serializeLayer(l)
+				return
+			}
+		}
+	})
+	return result
+}
+
+// LayerName returns the name of the given layer (empty string if not found).
+func (ws *WinState) LayerName(layID int) string {
+	var name string
+	ws.call(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				name = l.Name
+				return
+			}
+		}
+	})
+	return name
+}
+
+// SetLayerName renames a layer.
+func (ws *WinState) SetLayerName(layID int, name string) {
+	ws.submit(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				l.Name = name
+				return
+			}
+		}
+	})
+}
+
+// ClearLayer empties a layer's palette and runs, then schedules a flush.
+func (ws *WinState) ClearLayer(layID int) {
+	ws.submit(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				l.Palette = nil
+				l.Runs = nil
+				break
+			}
+		}
+		ws.scheduleFlush()
+	})
+}
+
+// DelLayer removes a layer entirely, then schedules a flush.
+func (ws *WinState) DelLayer(layID int) {
+	ws.submit(func(ws *WinState) {
+		for i, l := range ws.layers {
+			if l.ID == layID {
+				ws.layers = append(ws.layers[:i], ws.layers[i+1:]...)
+				break
+			}
+		}
+		ws.scheduleFlush()
+	})
+}
+
+// SetLayerStyle replaces a layer's palette and runs in full, then schedules
+// a flush.  Called at clunk of an ftStyle fid opened without an addr.
+func (ws *WinState) SetLayerStyle(layID int, palette []PaletteEntry, runs []StyleRun) {
+	ws.submit(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				l.Palette = palette
+				l.Runs = runs
+				break
+			}
+		}
+		ws.scheduleFlush()
+	})
+}
+
+// SpliceLayerStyle applies a partial update to a layer: removes existing runs
+// that overlap [q0, q1), inserts absRuns in their place, merges palette
+// entries by name, then schedules a flush.  Called at clunk of an ftStyle fid
+// opened with an addr.
+func (ws *WinState) SpliceLayerStyle(layID int, palette []PaletteEntry, absRuns []StyleRun, q0, q1 int) {
+	ws.submit(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID != layID {
+				continue
+			}
+			kept := l.Runs[:0]
+			for _, r := range l.Runs {
+				if r.End <= q0 || r.Start >= q1 {
+					kept = append(kept, r)
+				}
+			}
+			l.Runs = append(kept, absRuns...)
+			sort.Slice(l.Runs, func(i, j int) bool {
+				return l.Runs[i].Start < l.Runs[j].Start
+			})
+			for _, e := range palette {
+				merged := false
+				for i, oe := range l.Palette {
+					if oe.Name == e.Name {
+						l.Palette[i] = e
+						merged = true
+						break
+					}
+				}
+				if !merged {
+					l.Palette = append(l.Palette, e)
+				}
+			}
+			break
+		}
+		ws.scheduleFlush()
+	})
+}
+
+// ---- Config ----
 
 // Config holds all values parsed from the styles file.
 type Config struct {
@@ -90,70 +449,105 @@ type Config struct {
 	LayerOrder []string
 }
 
+// ---- Server ----
+
 // Server is the global service state.
+//
+// masterPalette and layerOrder are read-only after newServer returns and may
+// be accessed from any goroutine without holding mu.
+//
+// mu protects only the wins map; it is never held while doing any I/O.
 type Server struct {
-	mu            sync.Mutex
 	masterPalette []PaletteEntry
 	layerOrder    []string
-	wins          map[int]*WinState
-	ctx           context.Context // root context; cancelled on shutdown
+	// logConn and logFsys are a dedicated acme connection used for all
+	// long-polling id/log Tread calls.  Keeping them on a separate connection
+	// from the main acme fsys prevents log reads from stalling short-lived
+	// Style/Addr writes.  logConn is stored so that Close() can force-close
+	// the underlying socket at shutdown, immediately unblocking all pending
+	// Treads so run() goroutines can exit cleanly.
+	logConn *client.Conn
+	logFsys *client.Fsys
+
+	mu   sync.Mutex
+	wins map[int]*WinState
+	ctx  context.Context // root context; cancelled on shutdown
+	wg   sync.WaitGroup  // tracks live window goroutines
 }
 
-func newServer(cfg Config, ctx context.Context) *Server {
+func newServer(cfg Config, logConn *client.Conn, logFsys *client.Fsys, ctx context.Context) *Server {
 	return &Server{
 		masterPalette: cfg.Palette,
 		layerOrder:    cfg.LayerOrder,
+		logConn:       logConn,
+		logFsys:       logFsys,
 		wins:          make(map[int]*WinState),
 		ctx:           ctx,
 	}
 }
 
+// addWin creates a WinState and starts its goroutine for the given window ID.
+// Returns nil if the window was already registered.
+//
+// s.mu is never held while calling acme.Open: the lock is released, the
+// (potentially slow) open is performed, then the lock is re-acquired to
+// insert.  If another goroutine raced to add the same ID, the loser discards
+// what it opened.
 func (s *Server) addWin(id int) *WinState {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.wins[id]; !ok {
-		ctx, cancel := context.WithCancel(s.ctx)
-		ctx = logger.NewContext(ctx, logger.L(s.ctx).With(zap.Int("window", id)))
-		awin, err := acme.Open(id, nil)
-		if err != nil {
-			logger.L(ctx).Error("open acme window", zap.Error(err))
-		}
-		ws := &WinState{
-			ID:      id,
-			nextID:  1,
-			win:     awin,
-			flushCh: make(chan flushMsg, 8),
-			ctx:     ctx,
-			cancel:  cancel,
-		}
-		go ws.flusher(ctx)
-		s.wins[id] = ws
-		return ws
+	if _, ok := s.wins[id]; ok {
+		s.mu.Unlock()
+		return nil
 	}
-	return nil
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(s.ctx)
+	ctx = logger.NewContext(ctx, logger.L(s.ctx).With(zap.Int("window", id)))
+
+	logger.L(ctx).Debug("opening acme window")
+	awin, err := acme.Open(id, nil)
+	if err != nil {
+		logger.L(ctx).Error("open acme window", zap.Error(err))
+		// awin is nil; run() handles nil win gracefully.
+	}
+	logger.L(ctx).Debug("opened acme window", zap.Bool("ok", awin != nil))
+
+	ws := &WinState{
+		ID:     id,
+		ctx:    ctx,
+		cancel: cancel,
+		cmdCh:  make(chan func(*WinState), 64),
+		srv:    s,
+		win:    awin,
+		nextID: 1,
+	}
+
+	s.mu.Lock()
+	if _, ok := s.wins[id]; ok {
+		// Lost the race — another goroutine added this window first.
+		s.mu.Unlock()
+		cancel()
+		if awin != nil {
+			awin.CloseFiles()
+		}
+		return nil
+	}
+	s.wins[id] = ws
+	s.mu.Unlock()
+
+	s.wg.Add(1)
+	go ws.run()
+	return ws
 }
 
-// clearStyle sends a zero-byte style write to the window, triggering
-// winclearstyle + winframesync in acme and removing any stale styles from a
-// previous acme-styles run.
-func (ws *WinState) clearStyle() {
-	if ws.win == nil {
-		return
-	}
-	if err := ws.win.Style(nil); err != nil {
-		logger.L(ws.ctx).Error("clear style", zap.Error(err))
-	}
-}
-
+// delWin removes the window from the registry and cancels its goroutine.
+// The run() goroutine closes the acme.Win when it sees ctx.Done().
 func (s *Server) delWin(id int) {
 	s.mu.Lock()
 	ws := s.wins[id]
 	delete(s.wins, id)
 	s.mu.Unlock()
 	if ws != nil {
-		if ws.win != nil {
-			ws.win.CloseFiles()
-		}
 		ws.cancel()
 	}
 }
@@ -175,148 +569,22 @@ func (s *Server) winIDs() []int {
 	return ids
 }
 
-// masterPaletteCopy returns a safe snapshot of the master palette.
-func (s *Server) masterPaletteCopy() []PaletteEntry {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]PaletteEntry, len(s.masterPalette))
-	copy(out, s.masterPalette)
-	return out
-}
+// ---- edit tracking (called from run()) ----
 
-// layerOrderCopy returns a safe snapshot of the layer order list.
-func (s *Server) layerOrderCopy() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, len(s.layerOrder))
-	copy(out, s.layerOrder)
-	return out
-}
-
-// ---- layer management ----
-
-func (w *WinState) newLayer() *Layer {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	l := &Layer{ID: w.nextID, Name: strconv.Itoa(w.nextID)}
-	w.layers = append(w.layers, l)
-	w.nextID++
-	return l
-}
-
-func (w *WinState) getLayer(id int) *Layer {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for _, l := range w.layers {
-		if l.ID == id {
-			return l
-		}
-	}
-	return nil
-}
-
-func (w *WinState) layerIDs() []int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	ids := make([]int, 0, len(w.layers))
-	for _, l := range w.layers {
-		ids = append(ids, l.ID)
-	}
-	sort.Ints(ids)
-	return ids
-}
-
-func (w *WinState) indexText() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	var sb strings.Builder
-	for _, l := range w.layers {
-		fmt.Fprintf(&sb, "%d %s\n", l.ID, l.Name)
-	}
-	return sb.String()
-}
-
-func (w *WinState) styleText(layID int) string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for _, l := range w.layers {
-		if l.ID == layID {
-			return serializeLayer(l)
-		}
-	}
-	return ""
-}
-
-func (w *WinState) setLayerName(layID int, name string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for _, l := range w.layers {
-		if l.ID == layID {
-			l.Name = name
-			return
-		}
-	}
-}
-
-// clearLayer removes all palette entries and runs from the given layer.
-// Compose / writeStyle are deferred to flushLayer at fid clunk.
-func (w *WinState) clearLayer(layID int) {
-	w.mu.Lock()
-	for _, l := range w.layers {
-		if l.ID == layID {
-			l.Palette = nil
-			l.Runs = nil
-			break
-		}
-	}
-	w.mu.Unlock()
-}
-
-// delLayer removes the layer entirely from the window.
-// Compose / writeStyle are deferred to flushLayer at fid clunk.
-func (w *WinState) delLayer(layID int) {
-	w.mu.Lock()
-	for i, l := range w.layers {
-		if l.ID == layID {
-			w.layers = append(w.layers[:i], w.layers[i+1:]...)
-			break
-		}
-	}
-	w.mu.Unlock()
-}
-
-// ---- edit tracking ----
-
-// adjustRuns applies an insertion of n runes at q0 to a run slice in place.
 // adjustRunsInsert shifts and extends layer runs for an insertion of n runes
 // at q0.  Characters inserted strictly inside a run extend it; insertions at
-// a run boundary or in a gap leave existing runs untouched — the compositor
-// will resync on the next flush from acme-lsp or acme-treesitter.
+// a boundary fall into the right neighbour.
 func adjustRunsInsert(runs []StyleRun, q0, n int) {
 	for i := range runs {
 		r := &runs[i]
 		switch {
 		case q0 <= r.Start:
-			// At or before the run: shift it right.
 			r.Start += n
 			r.End += n
 		case q0 < r.End:
-			// Interior: extend the run.
 			r.End += n
-		// q0 >= r.End: run is entirely to the left; leave it.
 		}
 	}
-}
-
-// insertAt adjusts all layer run positions for n runes inserted at q0.
-// prevRuns is kept in sync so diffRuns sees accurate positions next flush.
-func (ws *WinState) insertAt(q0, n int) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	for _, l := range ws.layers {
-		adjustRunsInsert(l.Runs, q0, n)
-	}
-	adjustRunsInsert(ws.prevRuns, q0, n)
 }
 
 // adjustRunsDelete applies deletion of runes [q0, q1) to a run slice,
@@ -342,17 +610,6 @@ func adjustRunsDelete(runs []StyleRun, q0, q1 int) []StyleRun {
 		}
 	}
 	return out
-}
-
-// deleteRange adjusts all layer run positions for runes [q0, q1) removed.
-// prevRuns is kept in sync so diffRuns sees accurate positions next flush.
-func (ws *WinState) deleteRange(q0, q1 int) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	for _, l := range ws.layers {
-		l.Runs = adjustRunsDelete(l.Runs, q0, q1)
-	}
-	ws.prevRuns = adjustRunsDelete(ws.prevRuns, q0, q1)
 }
 
 // ---- parsing ----
@@ -401,20 +658,6 @@ func parseRunLine(line string) (StyleRun, bool) {
 }
 
 // ParseConfig parses the master styles file into a Config.
-//
-// Lines starting with ':' are palette entries.
-// Lines starting with '@' define the layer stacking order, one name per
-// line, highest priority first.  '*' is the wildcard slot for layers not
-// explicitly listed.  Lines starting with '#' and blank lines are ignored.
-//
-// Example:
-//
-//	@ highlight
-//	@ *
-//	@ lsp
-//	@ treesitter
-//	:base fg=#000000 bg=#ffffff
-//	:keyword fg=#569cd6 bold
 func ParseConfig(content string) Config {
 	var cfg Config
 	for _, line := range strings.Split(content, "\n") {
@@ -436,55 +679,29 @@ func ParseConfig(content string) Config {
 	return cfg
 }
 
-// parseStyleWrite processes accumulated write bytes for a layer style file.
-// Complete lines are parsed and added to the layer; the incomplete trailing
-// line stays in *wbuf for the next write call.
-func (w *WinState) parseStyleWrite(layID int, wbuf *[]byte) error {
-	buf := *wbuf
-	for {
-		nl := bytes.IndexByte(buf, '\n')
-		if nl < 0 {
-			break
-		}
-		line := strings.TrimSpace(string(buf[:nl]))
-		buf = buf[nl+1:]
+// parseStyleContent parses a complete style buffer (palette + run lines).
+func parseStyleContent(content string) ([]PaletteEntry, []StyleRun) {
+	var palette []PaletteEntry
+	var runs []StyleRun
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		if strings.HasPrefix(line, ":") {
-			e, ok := parsePaletteLine(line[1:])
-			if !ok {
-				continue
+			if e, ok := parsePaletteLine(line[1:]); ok {
+				palette = append(palette, e)
 			}
-			w.mu.Lock()
-			for _, l := range w.layers {
-				if l.ID == layID {
-					l.Palette = append(l.Palette, e)
-					break
-				}
-			}
-			w.mu.Unlock()
 		} else {
-			r, ok := parseRunLine(line)
-			if !ok {
-				continue
+			if r, ok := parseRunLine(line); ok {
+				runs = append(runs, r)
 			}
-			w.mu.Lock()
-			for _, l := range w.layers {
-				if l.ID == layID {
-					l.Runs = append(l.Runs, r)
-					break
-				}
-			}
-			w.mu.Unlock()
 		}
 	}
-	*wbuf = buf
-	return nil
+	return palette, runs
 }
 
 // ---- serialization ----
-
 
 func serializeLayer(l *Layer) string {
 	var sb strings.Builder
@@ -510,12 +727,6 @@ func paletteIdentical(a, b PaletteEntry) bool {
 }
 
 // mergePalettes merges the master palette with each layer's palette.
-// Returns the combined palette and, for each layer ID, a map translating
-// original palette-entry names to their (possibly renamed) output names.
-//
-// Conflict rule: if a layer's entry shares a name with an existing entry in
-// the merged set but has different visual properties, it is renamed to
-// name_<layerID>.  Identical definitions are de-duplicated.
 func mergePalettes(master []PaletteEntry, layers []*Layer) ([]PaletteEntry, map[int]map[string]string) {
 	out := append([]PaletteEntry{}, master...)
 	renameMaps := make(map[int]map[string]string)
@@ -534,14 +745,11 @@ func mergePalettes(master []PaletteEntry, layers []*Layer) ([]PaletteEntry, map[
 				}
 			}
 			if existingIdx < 0 {
-				// New name: add as-is.
 				out = append(out, e)
 				rm[origName] = origName
 			} else if paletteIdentical(out[existingIdx], e) {
-				// Same definition: no conflict.
 				rm[origName] = origName
 			} else {
-				// Conflict: rename to name_layerID.
 				newName := origName + "_" + strconv.Itoa(l.ID)
 				e.Name = newName
 				out = append(out, e)
@@ -553,13 +761,8 @@ func mergePalettes(master []PaletteEntry, layers []*Layer) ([]PaletteEntry, map[
 }
 
 // layerSortKey returns the sort key for a layer given the order list.
-// order[0] is highest priority; layers should end up at the highest slice
-// index in compose so the sweep-line picks them.  We therefore sort
-// descending by order position (larger position = lower priority = earlier
-// in slice = lower layerIdx = loses).  Unknown layers land at the '*'
-// wildcard position; if there is no '*' they go last (highest priority).
 func layerSortKey(order []string, name string) int {
-	wildcard := -1 // no '*' found yet → unknown layers go last
+	wildcard := -1
 	for i, n := range order {
 		if n == "*" {
 			wildcard = i
@@ -570,39 +773,33 @@ func layerSortKey(order []string, name string) int {
 	if wildcard >= 0 {
 		return wildcard
 	}
-	return len(order) // after all listed entries → highest priority
+	return len(order)
 }
 
 // compose merges the master palette with all layers and produces a sorted,
-// non-overlapping list of style runs.  Layers are ordered according to the
-// order slice (index 0 = highest priority; wins in the sweep-line).
+// non-overlapping list of style runs.
 func compose(master []PaletteEntry, order []string, layers []*Layer) ([]PaletteEntry, []StyleRun) {
 	if len(layers) == 0 {
 		return master, nil
 	}
 
-	// Sort layers so that the highest-priority layer ends up at the highest
-	// slice index (sweep-line picks highest layerIdx).
-	// Descending sort key means: larger key → appears earlier in sorted
-	// slice → lower layerIdx → loses.  Lowest key → last → highest layerIdx → wins.
 	sorted := make([]*Layer, len(layers))
 	copy(sorted, layers)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		ki := layerSortKey(order, sorted[i].Name)
 		kj := layerSortKey(order, sorted[j].Name)
 		if ki != kj {
-			return ki > kj // descending: higher position = lower priority = first
+			return ki > kj
 		}
-		return sorted[i].ID < sorted[j].ID // tiebreak: older layer loses
+		return sorted[i].ID < sorted[j].ID
 	})
 	layers = sorted
 
 	palette, renameMaps := mergePalettes(master, layers)
 
-	// Sweep-line event-based composition.
 	type event struct {
 		pos      int
-		layerIdx int // higher = higher priority
+		layerIdx int
 		name     string
 		isEnd    bool
 	}
@@ -614,7 +811,6 @@ func compose(master []PaletteEntry, order []string, layers []*Layer) ([]PaletteE
 			if r.End <= r.Start || r.Name == "" {
 				continue
 			}
-			// Translate name via rename map; fall through to as-is if not mapped.
 			name := r.Name
 			if rm != nil {
 				if renamed, ok := rm[r.Name]; ok {
@@ -635,12 +831,12 @@ func compose(master []PaletteEntry, order []string, layers []*Layer) ([]PaletteE
 			return events[i].pos < events[j].pos
 		}
 		if events[i].isEnd != events[j].isEnd {
-			return events[i].isEnd // ends before starts at same position
+			return events[i].isEnd
 		}
 		return events[i].layerIdx < events[j].layerIdx
 	})
 
-	active := make(map[int]string) // layerIdx → active run name
+	active := make(map[int]string)
 	bestName := func() string {
 		best, bestLayer := "", -1
 		for lay, name := range active {
@@ -674,94 +870,6 @@ func compose(master []PaletteEntry, order []string, layers []*Layer) ([]PaletteE
 	return palette, result
 }
 
-// ---- partial flush (addr mode) ----
-
-// parseStyleContent parses a complete style buffer (palette + run lines) into
-// its component parts.  Used by partialStyleFlush.
-func parseStyleContent(content string) ([]PaletteEntry, []StyleRun) {
-	var palette []PaletteEntry
-	var runs []StyleRun
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			if e, ok := parsePaletteLine(line[1:]); ok {
-				palette = append(palette, e)
-			}
-		} else {
-			if r, ok := parseRunLine(line); ok {
-				runs = append(runs, r)
-			}
-		}
-	}
-	return palette, runs
-}
-
-// partialStyleFlush applies an addr-relative write to a single layer then
-// recomposes and flushes all layers to acme.
-//
-// The bytes in wbuf were written to the layer's style fid with addr [q0, q1)
-// active.  Run offsets in wbuf are therefore relative to q0; this function
-// converts them to absolute, removes any existing runs for this layer that
-// overlap [q0, q1), inserts the new runs in their place, and merges any
-// palette entries by name (last writer wins for a given name).
-func (w *WinState) partialStyleFlush(layID int, wbuf []byte, q0, q1 int, masterPal []PaletteEntry, order []string) {
-	newPalette, relRuns := parseStyleContent(string(wbuf))
-
-	// Convert relative offsets → absolute; clip to [q0, q1).
-	absRuns := make([]StyleRun, 0, len(relRuns))
-	for _, r := range relRuns {
-		abs := StyleRun{r.Name, r.Start + q0, r.End + q0}
-		if abs.Start < q0 {
-			abs.Start = q0
-		}
-		if abs.End > q1 {
-			abs.End = q1
-		}
-		if abs.Start < abs.End {
-			absRuns = append(absRuns, abs)
-		}
-	}
-
-	w.mu.Lock()
-	for _, l := range w.layers {
-		if l.ID != layID {
-			continue
-		}
-		// Remove existing runs that overlap [q0, q1).
-		kept := l.Runs[:0]
-		for _, r := range l.Runs {
-			if r.End <= q0 || r.Start >= q1 {
-				kept = append(kept, r)
-			}
-		}
-		l.Runs = append(kept, absRuns...)
-		sort.Slice(l.Runs, func(i, j int) bool {
-			return l.Runs[i].Start < l.Runs[j].Start
-		})
-		// Merge palette entries by name (new entry wins on conflict).
-		for _, e := range newPalette {
-			merged := false
-			for i, oe := range l.Palette {
-				if oe.Name == e.Name {
-					l.Palette[i] = e
-					merged = true
-					break
-				}
-			}
-			if !merged {
-				l.Palette = append(l.Palette, e)
-			}
-		}
-		break
-	}
-	w.mu.Unlock()
-
-	w.flushLayer(masterPal, order)
-}
-
 // ---- diff ----
 
 // palettesEqual reports whether two palettes have the same named entries
@@ -783,33 +891,24 @@ func palettesEqual(a, b []PaletteEntry) bool {
 	return true
 }
 
-// diffRuns finds the minimal dirty interval between two sorted, non-overlapping
-// run slices using a forward/backward scan (Gosling-style redisplay).
-//
-// The forward scan advances matching runs from the front; the backward scan
-// removes matching runs from the back.  The dirty interval is the union of the
-// file-space extents of the remaining (changed) spans on each side.
-//
-// Returns changed=false when the sequences are identical.
+// diffRuns finds the minimal dirty interval between two sorted,
+// non-overlapping run slices.
 func diffRuns(old, new []StyleRun) (q0, q1 int, changed bool) {
-	// Forward scan: skip identical prefix.
 	i, j := 0, 0
 	for i < len(old) && j < len(new) && old[i] == new[j] {
 		i++
 		j++
 	}
 	if i == len(old) && j == len(new) {
-		return 0, 0, false // identical
+		return 0, 0, false
 	}
 
-	// Backward scan: skip identical suffix.
 	ei, ej := len(old)-1, len(new)-1
 	for ei >= i && ej >= j && old[ei] == new[ej] {
 		ei--
 		ej--
 	}
 
-	// Dirty interval: union of the changed spans' file extents.
 	const maxInt = int(^uint(0) >> 1)
 	q0 = maxInt
 	for _, r := range old[i : ei+1] {
@@ -829,85 +928,17 @@ func diffRuns(old, new []StyleRun) (q0, q1 int, changed bool) {
 		}
 	}
 	if q0 == maxInt || q0 >= q1 {
-		// Changed spans have no file-space extent (shouldn't happen with valid
-		// non-empty runs, but fall back to full write for safety).
 		return 0, 0, false
 	}
 	return q0, q1, true
 }
 
-// ---- flush ----
+// ---- flush (called from run()) ----
 
-// flushLayer composes all layers and sends the result to the per-window
-// flusher goroutine, which batches rapid calls into a single write to acme.
-func (w *WinState) flushLayer(masterPal []PaletteEntry, order []string) {
-	w.mu.Lock()
-	snapshot := append([]*Layer(nil), w.layers...)
-	w.mu.Unlock()
-
-	newPalette, newRuns := compose(masterPal, order, snapshot)
-
-	select {
-	case w.flushCh <- flushMsg{newPalette, newRuns}:
-	case <-w.ctx.Done():
-	}
-}
-
-// flusher is the per-window goroutine that coalesces rapid flushLayer calls.
-// ctx is a child of the server root context, cancelled by delWin when the
-// window closes or by the root when the process shuts down.
-func (w *WinState) flusher(ctx context.Context) {
-	timer := time.NewTimer(coalesceDelay)
-	timer.Stop()
-
-	var pending *flushMsg
-
-	for {
-		select {
-		case msg := <-w.flushCh:
-			pending = &msg
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(coalesceDelay)
-
-		case <-timer.C:
-			if pending == nil {
-				continue
-			}
-			w.mu.Lock()
-			oldPal := w.prevPalette
-			oldRuns := w.prevRuns
-			w.mu.Unlock()
-
-			w.diffAndWrite(oldPal, pending.pal, oldRuns, pending.runs)
-
-			w.mu.Lock()
-			w.prevPalette = pending.pal
-			w.prevRuns = pending.runs
-			w.mu.Unlock()
-
-			pending = nil
-
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		}
-	}
-}
-
-// diffAndWrite compares the old and new composition results and issues the
-// minimal write to acme via Win:
-//
-//   - If the palette changed, a full replacement is required.
-//   - If only runs changed, diffRuns finds the dirty interval and a partial
-//     addr-scoped write is used.
-//   - If nothing changed, no write is issued.
-func (w *WinState) diffAndWrite(oldPal, newPal []PaletteEntry, oldRuns, newRuns []StyleRun) {
-	if w.win == nil {
+// diffAndWrite compares old and new compositions and writes the minimal
+// diff to acme.  Must be called from within the window goroutine.
+func (ws *WinState) diffAndWrite(oldPal, newPal []PaletteEntry, oldRuns, newRuns []StyleRun) {
+	if ws.win == nil {
 		return
 	}
 	if palettesEqual(oldPal, newPal) {
@@ -915,19 +946,20 @@ func (w *WinState) diffAndWrite(oldPal, newPal []PaletteEntry, oldRuns, newRuns 
 		if !changed {
 			return
 		}
-		if err := w.win.Addr("#%d,#%d", q0, q1); err != nil {
-			// addr failed; fall back to full write with full data.
-			if err := w.win.Style([]byte(formatStyleFull(newPal, newRuns))); err != nil {
-				logger.L(w.ctx).Error("full style write", zap.Error(err))
+		if err := ws.win.Addr("#%d,#%d", q0, q1); err != nil {
+			if err := ws.win.Style([]byte(formatStyleFull(newPal, newRuns))); err != nil {
+				logger.L(ws.ctx).Error("full style write", zap.Error(err))
 			}
 			return
 		}
-		if err := w.win.Style([]byte(formatStyleAt(newPal, newRuns, q0, q1))); err != nil {
-			logger.L(w.ctx).Error("partial style write", zap.Error(err))
+		if err := ws.win.Style([]byte(formatStyleAt(newPal, newRuns, q0, q1))); err != nil {
+			logger.L(ws.ctx).Error("partial style write", zap.Error(err))
 		}
 		return
 	}
-	if err := w.win.Style([]byte(formatStyleFull(newPal, newRuns))); err != nil {
-		logger.L(w.ctx).Error("full style write", zap.Error(err))
+	if err := ws.win.Style([]byte(formatStyleFull(newPal, newRuns))); err != nil {
+		logger.L(ws.ctx).Error("full style write", zap.Error(err))
 	}
 }
+
+

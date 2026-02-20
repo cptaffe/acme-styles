@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"9fans.net/go/plan9"
+	"github.com/cptaffe/acme-styles/logger"
+	"go.uber.org/zap"
 )
 
 // File-type constants; encode directly into Qid.Path.
@@ -108,10 +110,9 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 		if err != nil {
 			return 0, 0, 0, ErrNoFile
 		}
-		// Create a WinState on demand so that windows which were already open
-		// when acme-styles started (and thus missed the log "new" event) can
-		// still have layers allocated for them.
-		s.addWin(id)
+		// Accept any numeric window ID.  WinStates are created by watchLog;
+		// operations that need the state (NewLayer, etc.) check getWin and
+		// return "window gone" if it has not been registered yet.
 		return ftWinDir, id, 0, nil
 	case ftWinDir:
 		if name == "layers" {
@@ -130,7 +131,7 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 			return 0, 0, 0, ErrNoFile
 		}
 		w := s.getWin(winID)
-		if w == nil || w.getLayer(id) == nil {
+		if w == nil || !w.LayerExists(id) {
 			return 0, 0, 0, ErrNoFile
 		}
 		return ftLayerDir, winID, id, nil
@@ -165,7 +166,7 @@ func (s *Server) readDir(ft, winID, layID int) []byte {
 		dirs = append(dirs, s.makeDir(ftNew, winID, 0))
 		dirs = append(dirs, s.makeDir(ftIndex, winID, 0))
 		if w := s.getWin(winID); w != nil {
-			for _, id := range w.layerIDs() {
+			for _, id := range w.LayerIDs() {
 				dirs = append(dirs, s.makeDir(ftLayerDir, winID, id))
 			}
 		}
@@ -200,13 +201,12 @@ type fid struct {
 	open  bool
 	mode  uint8
 	buf   []byte // buffered read content (set at Topen)
-	wbuf  []byte // accumulated write bytes
+	wbuf  []byte // accumulated write bytes (flushed at Tclunk)
 	// addr for partial style writes; captured from conn.pendingAddr when this
 	// ftStyle fid is opened OWRITE.
-	hasAddr    bool
-	addrQ0     int
-	addrQ1     int
-	needsFlush bool // set by ftCtl when a command requires a composition flush
+	hasAddr bool
+	addrQ0  int
+	addrQ1  int
 }
 
 type conn struct {
@@ -218,6 +218,7 @@ type conn struct {
 
 func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
+	log := logger.L(s.ctx)
 	cn := &conn{
 		srv:         s,
 		fids:        make(map[uint32]*fid),
@@ -229,7 +230,13 @@ func (s *Server) handleConn(c net.Conn) {
 		if err != nil {
 			return
 		}
+		start := time.Now()
 		resp := cn.dispatch(fc)
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			log.Warn("slow dispatch",
+				zap.String("type", fcallTypeName(fc.Type)),
+				zap.Duration("elapsed", elapsed))
+		}
 		if err := plan9.WriteFcall(c, resp); err != nil {
 			return
 		}
@@ -279,7 +286,7 @@ func (cn *conn) doVersion(fc *plan9.Fcall) *plan9.Fcall {
 		msize = cn.msize
 	}
 	cn.msize = msize
-	cn.fids = make(map[uint32]*fid) // reset on Tversion
+	cn.fids = make(map[uint32]*fid)
 	ver := "9P2000"
 	if !strings.HasPrefix(fc.Version, "9P2000") {
 		ver = "unknown"
@@ -322,11 +329,9 @@ func (cn *conn) doWalk(fc *plan9.Fcall) *plan9.Fcall {
 
 	newf := &fid{ft: curFt, winID: curWin, layID: curLay}
 	if len(fc.Wname) == 0 {
-		// clone
 		newf.ft, newf.winID, newf.layID = f.ft, f.winID, f.layID
 	}
 
-	// Register newfid only if walk fully succeeded (or it's a clone).
 	if len(wqids) == len(fc.Wname) {
 		cn.fids[fc.Newfid] = newf
 	}
@@ -360,9 +365,9 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		if w == nil {
 			return rerr(fc.Tag, "window gone")
 		}
-		l := w.newLayer()
-		f.layID = l.ID
-		f.buf = []byte(strconv.Itoa(l.ID) + "\n")
+		id := w.NewLayer()
+		f.layID = id
+		f.buf = []byte(strconv.Itoa(id) + "\n")
 
 	case ftIndex:
 		if mode != plan9.OREAD {
@@ -372,17 +377,13 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		if w == nil {
 			return rerr(fc.Tag, "window gone")
 		}
-		f.buf = []byte(w.indexText())
+		f.buf = []byte(w.IndexText())
 
 	case ftName:
 		if mode == plan9.OREAD || mode == plan9.ORDWR {
 			w := s.getWin(f.winID)
 			if w != nil {
-				if l := w.getLayer(f.layID); l != nil {
-					w.mu.Lock()
-					f.buf = []byte(l.Name + "\n")
-					w.mu.Unlock()
-				}
+				f.buf = []byte(w.LayerName(f.layID) + "\n")
 			}
 		}
 
@@ -400,7 +401,7 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		if mode == plan9.OREAD || mode == plan9.ORDWR {
 			w := s.getWin(f.winID)
 			if w != nil {
-				f.buf = []byte(w.styleText(f.layID))
+				f.buf = []byte(w.StyleText(f.layID))
 			}
 		}
 		if mode == plan9.OWRITE || mode == plan9.ORDWR {
@@ -411,12 +412,6 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 				f.addrQ0 = ar.q0
 				f.addrQ1 = ar.q1
 				delete(cn.pendingAddr, key)
-			}
-			w := s.getWin(f.winID)
-			if w != nil && !f.hasAddr {
-				// Full replace: clear so subsequent writes start from scratch.
-				// Addr mode preserves existing content; partialStyleFlush splices.
-				w.clearLayer(f.layID)
 			}
 		}
 	}
@@ -464,8 +459,6 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 
 	switch f.ft {
 	case ftCtl:
-		// Accumulate writes and parse line-oriented commands at each newline.
-		// Current commands: "clear"
 		f.wbuf = append(f.wbuf, fc.Data...)
 		for {
 			nl := bytes.IndexByte(f.wbuf, '\n')
@@ -483,19 +476,15 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 			}
 			switch cmd {
 			case "clear":
-				w.clearLayer(f.layID)
-				f.needsFlush = true
+				w.ClearLayer(f.layID)
 			case "delete":
-				w.delLayer(f.layID)
-				f.needsFlush = true
+				w.DelLayer(f.layID)
 			default:
 				return rerr(fc.Tag, "unknown ctl command: "+cmd)
 			}
 		}
 
 	case ftAddr:
-		// Accumulate and parse "q0 q1"; store as the pending addr for the next
-		// ftStyle OWRITE on this (winID, layID).
 		f.wbuf = append(f.wbuf, fc.Data...)
 		text := strings.TrimSpace(string(f.wbuf))
 		var q0, q1 int
@@ -509,22 +498,11 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 			return rerr(fc.Tag, "window gone")
 		}
 		name := strings.TrimRight(string(fc.Data), "\n\r ")
-		w.setLayerName(f.layID, name)
+		w.SetLayerName(f.layID, name)
 
 	case ftStyle:
-		w := s.getWin(f.winID)
-		if w == nil {
-			return rerr(fc.Tag, "window gone")
-		}
+		// Accumulate all writes; parse and apply as one unit at clunk.
 		f.wbuf = append(f.wbuf, fc.Data...)
-		if !f.hasAddr {
-			// Full-replace mode: parse incrementally so insertAt/deleteRange
-			// from watchWindow can track live runs between writes and clunk.
-			if err := w.parseStyleWrite(f.layID, &f.wbuf); err != nil {
-				return rerr(fc.Tag, err.Error())
-			}
-		}
-		// Addr mode: leave raw bytes in f.wbuf; parse + splice at clunk.
 
 	default:
 		return rerr(fc.Tag, "not writable")
@@ -537,19 +515,28 @@ func (cn *conn) doClunk(fc *plan9.Fcall) *plan9.Fcall {
 	if f != nil && f.open {
 		mode := f.mode & 3
 		isWrite := mode == plan9.OWRITE || mode == plan9.ORDWR
-		needsFlush := isWrite && f.ft == ftStyle ||
-			f.ft == ftCtl && f.needsFlush
-		if needsFlush {
+		if isWrite && f.ft == ftStyle {
 			w := cn.srv.getWin(f.winID)
 			if w != nil {
-				pal := cn.srv.masterPaletteCopy()
-				ord := cn.srv.layerOrderCopy()
-				if f.ft == ftStyle && f.hasAddr {
-					// Partial update: parse staged wbuf, adjust offsets relative
-					// to addrQ0, splice runs into the layer, merge palette, flush.
-					w.partialStyleFlush(f.layID, f.wbuf, f.addrQ0, f.addrQ1, pal, ord)
+				palette, runs := parseStyleContent(string(f.wbuf))
+				if f.hasAddr {
+					// Convert addr-relative offsets to absolute, clip to [q0, q1).
+					absRuns := make([]StyleRun, 0, len(runs))
+					for _, r := range runs {
+						abs := StyleRun{r.Name, r.Start + f.addrQ0, r.End + f.addrQ0}
+						if abs.Start < f.addrQ0 {
+							abs.Start = f.addrQ0
+						}
+						if abs.End > f.addrQ1 {
+							abs.End = f.addrQ1
+						}
+						if abs.Start < abs.End {
+							absRuns = append(absRuns, abs)
+						}
+					}
+					w.SpliceLayerStyle(f.layID, palette, absRuns, f.addrQ0, f.addrQ1)
 				} else {
-					w.flushLayer(pal, ord)
+					w.SetLayerStyle(f.layID, palette, runs)
 				}
 			}
 		}
@@ -571,4 +558,35 @@ func (cn *conn) doStat(fc *plan9.Fcall) *plan9.Fcall {
 	return &plan9.Fcall{Type: plan9.Rstat, Tag: fc.Tag, Stat: stat}
 }
 
-
+func fcallTypeName(t uint8) string {
+	switch t {
+	case plan9.Tversion:
+		return "Tversion"
+	case plan9.Tauth:
+		return "Tauth"
+	case plan9.Tattach:
+		return "Tattach"
+	case plan9.Tflush:
+		return "Tflush"
+	case plan9.Twalk:
+		return "Twalk"
+	case plan9.Topen:
+		return "Topen"
+	case plan9.Tcreate:
+		return "Tcreate"
+	case plan9.Tread:
+		return "Tread"
+	case plan9.Twrite:
+		return "Twrite"
+	case plan9.Tclunk:
+		return "Tclunk"
+	case plan9.Tremove:
+		return "Tremove"
+	case plan9.Tstat:
+		return "Tstat"
+	case plan9.Twstat:
+		return "Twstat"
+	default:
+		return fmt.Sprintf("T%d", t)
+	}
+}
