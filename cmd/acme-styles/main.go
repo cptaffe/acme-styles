@@ -88,6 +88,8 @@ func main() {
 
 // watchLog seeds window state from acme and then streams opens/closes.
 // Any failure is fatal — launchd will restart us.
+// Each addWin call starts a window goroutine that clears stale styles and
+// tracks edits; no extra per-window goroutines are needed here.
 func watchLog(s *Server) {
 	l := logger.L(s.ctx)
 	wins, err := acme.Windows()
@@ -95,11 +97,7 @@ func watchLog(s *Server) {
 		l.Fatal("acme.Windows", zap.Error(err))
 	}
 	for _, w := range wins {
-		ws := s.addWin(w.ID)
-		if ws != nil {
-			go ws.clearStyle()
-			go watchWindow(ws)
-		}
+		s.addWin(w.ID)
 	}
 
 	lr, err := acme.Log()
@@ -113,27 +111,9 @@ func watchLog(s *Server) {
 		}
 		switch ev.Op {
 		case "new":
-			if ws := s.addWin(ev.ID); ws != nil {
-				go watchWindow(ws)
-			}
+			s.addWin(ev.ID)
 		case "del":
 			s.delWin(ev.ID)
-		}
-	}
-}
-
-// watchWindow reads ws.win's log channel and tracks body insertions and
-// deletions so that all layer run positions stay correct between style updates.
-func watchWindow(ws *WinState) {
-	if ws.win == nil {
-		return
-	}
-	for e := range ws.win.LogChan() {
-		switch e.Op {
-		case 'I':
-			ws.insertAt(e.Q0, e.Q1)
-		case 'D':
-			ws.deleteRange(e.Q0, e.Q1)
 		}
 	}
 }
