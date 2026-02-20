@@ -1,4 +1,4 @@
-module acme-styles
+module github.com/cptaffe/acme-styles
 
 go 1.21
 
