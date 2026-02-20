@@ -64,7 +64,23 @@ func main() {
 	defer stop()
 	ctx = logger.NewContext(ctx, l)
 
-	s := newServer(cfg, ctx)
+	// Dedicated connection for log reads: keeps long-polling Tread calls off
+	// the shared acme connection so they can't stall short-lived Style/Addr
+	// writes.  logConn is stored so we can force-close the socket at shutdown,
+	// immediately unblocking all pending Treads.
+	type logMount struct {
+		conn *client.Conn
+		fsys *client.Fsys
+	}
+	lm, err := retryOn(ctx, 10, 200*time.Millisecond, func() (logMount, error) {
+		c, f, err := client.MountServiceConn("acme")
+		return logMount{c, f}, err
+	})
+	if err != nil {
+		l.Fatal("mount acme (log)", zap.Error(err))
+	}
+
+	s := newServer(cfg, lm.conn, lm.fsys, ctx)
 	go watchLog(s)
 
 	os.Remove(srvPath)
@@ -97,11 +113,11 @@ func main() {
 	}
 
 	l.Info("shutting down; waiting for window goroutines")
-	// Close the log pool first: this closes every pooled acme connection,
-	// causing all pending long-polling Tread calls to fail immediately.
-	// The startLogChan goroutines then exit, close their channels, and
-	// run() goroutines see ctx.Done() → CloseFiles() → wg.Done().
-	s.logPool.Close()
+	// Force-close the log connection: closes the socket immediately, causing
+	// all pending long-polling Tread calls to fail.  The startLogChan goroutines
+	// exit, close their channels, and run() goroutines see ctx.Done() →
+	// CloseFiles() → wg.Done().
+	s.logConn.Close() //nolint:errcheck
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
 	select {

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
+	"9fans.net/go/plan9"
+	"9fans.net/go/plan9/client"
 	"github.com/cptaffe/acme-styles/logger"
 	"go.uber.org/zap"
 )
@@ -180,16 +182,14 @@ func (ws *WinState) run() {
 	}
 }
 
-// startLogChan acquires a slot from the server's log connection pool, opens
-// id/log on it, and returns a channel that delivers edit events.
-//
-// The pool keeps each connection's outstanding Tread count below
-// logPoolMaxLoad (48), leaving headroom under 9pserve's MAXMSG=64 limit for
-// the transient Walk+Open messages needed at startup.
+// startLogChan opens id/log on the server's dedicated log connection and
+// returns a channel that delivers edit events.  The goroutine exits when the
+// fid returns an error (e.g. because logConn was force-closed at shutdown) or
+// ctx is cancelled.
 func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
 	log := logger.L(ws.ctx)
 	log.Debug("opening log fid")
-	fid, release, err := ws.srv.logPool.open(ws.ID)
+	fid, err := ws.srv.logFsys.Open(fmt.Sprintf("%d/log", ws.ID), plan9.OREAD)
 	if err != nil {
 		log.Error("open log", zap.Error(err))
 		return nil
@@ -197,7 +197,6 @@ func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
 	log.Debug("opened log fid")
 	ch := make(chan *acme.WinLogEvent)
 	go func() {
-		defer release()
 		defer fid.Close()
 		defer close(ch)
 		for {
@@ -461,7 +460,14 @@ type Config struct {
 type Server struct {
 	masterPalette []PaletteEntry
 	layerOrder    []string
-	logPool       *logPool // pool of acme connections for long-polling log reads
+	// logConn and logFsys are a dedicated acme connection used for all
+	// long-polling id/log Tread calls.  Keeping them on a separate connection
+	// from the main acme fsys prevents log reads from stalling short-lived
+	// Style/Addr writes.  logConn is stored so that Close() can force-close
+	// the underlying socket at shutdown, immediately unblocking all pending
+	// Treads so run() goroutines can exit cleanly.
+	logConn *client.Conn
+	logFsys *client.Fsys
 
 	mu   sync.Mutex
 	wins map[int]*WinState
@@ -469,11 +475,12 @@ type Server struct {
 	wg   sync.WaitGroup  // tracks live window goroutines
 }
 
-func newServer(cfg Config, ctx context.Context) *Server {
+func newServer(cfg Config, logConn *client.Conn, logFsys *client.Fsys, ctx context.Context) *Server {
 	return &Server{
 		masterPalette: cfg.Palette,
 		layerOrder:    cfg.LayerOrder,
-		logPool:       newLogPool(),
+		logConn:       logConn,
+		logFsys:       logFsys,
 		wins:          make(map[int]*WinState),
 		ctx:           ctx,
 	}
