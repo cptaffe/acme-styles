@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -18,8 +20,9 @@ const (
 	ftIndex     = 4
 	ftLayerDir  = 5
 	ftName      = 6
-	ftClear     = 7
+	ftCtl       = 7
 	ftStyle     = 8
+	ftAddr      = 9
 )
 
 func isDir(ft int) bool {
@@ -64,12 +67,15 @@ func (s *Server) makeDir(ft, winID, layID int) plan9.Dir {
 	case ftName:
 		name = "name"
 		mode = 0666
-	case ftClear:
-		name = "clear"
+	case ftCtl:
+		name = "ctl"
 		mode = 0222
 	case ftStyle:
 		name = "style"
 		mode = 0666
+	case ftAddr:
+		name = "addr"
+		mode = 0222
 	}
 	return plan9.Dir{
 		Qid:   s.makeQID(ft, winID, layID),
@@ -102,9 +108,10 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 		if err != nil {
 			return 0, 0, 0, ErrNoFile
 		}
-		if s.getWin(id) == nil {
-			return 0, 0, 0, ErrNoFile
-		}
+		// Create a WinState on demand so that windows which were already open
+		// when acme-styles started (and thus missed the log "new" event) can
+		// still have layers allocated for them.
+		s.addWin(id)
 		return ftWinDir, id, 0, nil
 	case ftWinDir:
 		if name == "layers" {
@@ -131,10 +138,12 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 		switch name {
 		case "name":
 			return ftName, winID, layID, nil
-		case "clear":
-			return ftClear, winID, layID, nil
+		case "ctl":
+			return ftCtl, winID, layID, nil
 		case "style":
 			return ftStyle, winID, layID, nil
+		case "addr":
+			return ftAddr, winID, layID, nil
 		}
 		return 0, 0, 0, ErrNoFile
 	default:
@@ -162,8 +171,9 @@ func (s *Server) readDir(ft, winID, layID int) []byte {
 		}
 	case ftLayerDir:
 		dirs = append(dirs, s.makeDir(ftName, winID, layID))
-		dirs = append(dirs, s.makeDir(ftClear, winID, layID))
+		dirs = append(dirs, s.makeDir(ftCtl, winID, layID))
 		dirs = append(dirs, s.makeDir(ftStyle, winID, layID))
+		dirs = append(dirs, s.makeDir(ftAddr, winID, layID))
 	}
 	var buf []byte
 	for _, d := range dirs {
@@ -176,6 +186,13 @@ func (s *Server) readDir(ft, winID, layID int) []byte {
 
 // ---- per-connection state ----
 
+// winLayKey identifies a (window, layer) pair for pending addr tracking.
+type winLayKey struct{ winID, layID int }
+
+// addrRange is a pending addr written to ftAddr, consumed by the next
+// ftStyle OWRITE on the same (winID, layID).
+type addrRange struct{ q0, q1 int }
+
 type fid struct {
 	ft    int
 	winID int
@@ -183,21 +200,29 @@ type fid struct {
 	open  bool
 	mode  uint8
 	buf   []byte // buffered read content (set at Topen)
-	wbuf  []byte // accumulated write bytes (style/name)
+	wbuf  []byte // accumulated write bytes
+	// addr for partial style writes; captured from conn.pendingAddr when this
+	// ftStyle fid is opened OWRITE.
+	hasAddr    bool
+	addrQ0     int
+	addrQ1     int
+	needsFlush bool // set by ftCtl when a command requires a composition flush
 }
 
 type conn struct {
-	srv   *Server
-	fids  map[uint32]*fid
-	msize uint32
+	srv         *Server
+	fids        map[uint32]*fid
+	msize       uint32
+	pendingAddr map[winLayKey]addrRange // set by ftAddr write; consumed by ftStyle open
 }
 
 func (s *Server) handleConn(c net.Conn) {
 	defer c.Close()
 	cn := &conn{
-		srv:   s,
-		fids:  make(map[uint32]*fid),
-		msize: 8192 + plan9.IOHDRSZ,
+		srv:         s,
+		fids:        make(map[uint32]*fid),
+		msize:       8192 + plan9.IOHDRSZ,
+		pendingAddr: make(map[winLayKey]addrRange),
 	}
 	for {
 		fc, err := plan9.ReadFcall(c)
@@ -361,14 +386,14 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 			}
 		}
 
-	case ftClear:
-		if mode == plan9.OREAD {
+	case ftCtl:
+		if mode != plan9.OWRITE {
 			return rerr(fc.Tag, "permission denied")
 		}
-		// Clear the layer immediately at open; flushLayer is called at clunk.
-		w := s.getWin(f.winID)
-		if w != nil {
-			w.clearLayer(f.layID)
+
+	case ftAddr:
+		if mode != plan9.OWRITE {
+			return rerr(fc.Tag, "permission denied")
 		}
 
 	case ftStyle:
@@ -378,11 +403,19 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 				f.buf = []byte(w.styleText(f.layID))
 			}
 		}
-		// For write-mode opens, clear the layer so that the subsequent writes
-		// replace rather than accumulate.  flushLayer is called at clunk.
 		if mode == plan9.OWRITE || mode == plan9.ORDWR {
+			// Capture any pending addr written to ftAddr on this connection.
+			key := winLayKey{f.winID, f.layID}
+			if ar, ok := cn.pendingAddr[key]; ok {
+				f.hasAddr = true
+				f.addrQ0 = ar.q0
+				f.addrQ1 = ar.q1
+				delete(cn.pendingAddr, key)
+			}
 			w := s.getWin(f.winID)
-			if w != nil {
+			if w != nil && !f.hasAddr {
+				// Full replace: clear so subsequent writes start from scratch.
+				// Addr mode preserves existing content; partialStyleFlush splices.
 				w.clearLayer(f.layID)
 			}
 		}
@@ -430,8 +463,45 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 	n := len(fc.Data)
 
 	switch f.ft {
-	case ftClear:
-		// clearing already happened at Topen; silently accept writes
+	case ftCtl:
+		// Accumulate writes and parse line-oriented commands at each newline.
+		// Current commands: "clear"
+		f.wbuf = append(f.wbuf, fc.Data...)
+		for {
+			nl := bytes.IndexByte(f.wbuf, '\n')
+			if nl < 0 {
+				break
+			}
+			cmd := strings.TrimSpace(string(f.wbuf[:nl]))
+			f.wbuf = f.wbuf[nl+1:]
+			if cmd == "" {
+				continue
+			}
+			w := s.getWin(f.winID)
+			if w == nil {
+				return rerr(fc.Tag, "window gone")
+			}
+			switch cmd {
+			case "clear":
+				w.clearLayer(f.layID)
+				f.needsFlush = true
+			case "delete":
+				w.delLayer(f.layID)
+				f.needsFlush = true
+			default:
+				return rerr(fc.Tag, "unknown ctl command: "+cmd)
+			}
+		}
+
+	case ftAddr:
+		// Accumulate and parse "q0 q1"; store as the pending addr for the next
+		// ftStyle OWRITE on this (winID, layID).
+		f.wbuf = append(f.wbuf, fc.Data...)
+		text := strings.TrimSpace(string(f.wbuf))
+		var q0, q1 int
+		if _, err := fmt.Sscanf(text, "%d %d", &q0, &q1); err == nil {
+			cn.pendingAddr[winLayKey{f.winID, f.layID}] = addrRange{q0, q1}
+		}
 
 	case ftName:
 		w := s.getWin(f.winID)
@@ -447,9 +517,14 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 			return rerr(fc.Tag, "window gone")
 		}
 		f.wbuf = append(f.wbuf, fc.Data...)
-		if err := w.parseStyleWrite(f.layID, &f.wbuf, s.styles); err != nil {
-			return rerr(fc.Tag, err.Error())
+		if !f.hasAddr {
+			// Full-replace mode: parse incrementally so insertAt/deleteRange
+			// from watchWindow can track live runs between writes and clunk.
+			if err := w.parseStyleWrite(f.layID, &f.wbuf); err != nil {
+				return rerr(fc.Tag, err.Error())
+			}
 		}
+		// Addr mode: leave raw bytes in f.wbuf; parse + splice at clunk.
 
 	default:
 		return rerr(fc.Tag, "not writable")
@@ -462,11 +537,20 @@ func (cn *conn) doClunk(fc *plan9.Fcall) *plan9.Fcall {
 	if f != nil && f.open {
 		mode := f.mode & 3
 		isWrite := mode == plan9.OWRITE || mode == plan9.ORDWR
-		if isWrite && (f.ft == ftClear || f.ft == ftStyle) {
-			// One writeStyle per fid lifetime: flush now that all writes are done.
+		needsFlush := isWrite && f.ft == ftStyle ||
+			f.ft == ftCtl && f.needsFlush
+		if needsFlush {
 			w := cn.srv.getWin(f.winID)
 			if w != nil {
-				w.flushLayer()
+				pal := cn.srv.masterPaletteCopy()
+				ord := cn.srv.layerOrderCopy()
+				if f.ft == ftStyle && f.hasAddr {
+					// Partial update: parse staged wbuf, adjust offsets relative
+					// to addrQ0, splice runs into the layer, merge palette, flush.
+					w.partialStyleFlush(f.layID, f.wbuf, f.addrQ0, f.addrQ1, pal, ord)
+				} else {
+					w.flushLayer(pal, ord)
+				}
 			}
 		}
 	}
