@@ -71,27 +71,44 @@ func main() {
 	if err != nil {
 		l.Fatal("listen", zap.String("path", srvPath), zap.Error(err))
 	}
-	defer ln.Close()
 	defer os.Remove(srvPath)
+	defer ln.Close()
+
+	// Close the listener when the context is cancelled so that Accept
+	// returns an error and the loop below can exit.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
 
 	l.Info("listening", zap.String("addr", srvPath))
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
 			l.Error("accept", zap.Error(err))
 			continue
 		}
 		go s.handleConn(c)
 	}
+
+	l.Info("shutting down")
 }
 
 // watchLog seeds window state from acme and then streams opens/closes.
-// Any failure is fatal — launchd will restart us.
 // Each addWin call starts a window goroutine that clears stale styles and
 // tracks edits; no extra per-window goroutines are needed here.
+//
+// lr.Read() is a blocking call; we wrap each call in a goroutine and select
+// against ctx.Done() so that a signal causes a clean exit.  The in-flight
+// goroutine may linger briefly after shutdown — that is fine because the
+// process is about to exit.
 func watchLog(s *Server) {
 	l := logger.L(s.ctx)
+
 	wins, err := acme.Windows()
 	if err != nil {
 		l.Fatal("acme.Windows", zap.Error(err))
@@ -104,16 +121,40 @@ func watchLog(s *Server) {
 	if err != nil {
 		l.Fatal("acme.Log", zap.Error(err))
 	}
+	defer lr.Close()
+
+	type logResult struct {
+		ev  acme.LogEvent
+		err error
+	}
+	ch := make(chan logResult, 1)
+
+	readNext := func() {
+		go func() {
+			ev, err := lr.Read()
+			ch <- logResult{ev, err}
+		}()
+	}
+	readNext()
+
 	for {
-		ev, err := lr.Read()
-		if err != nil {
-			l.Fatal("acme log", zap.Error(err))
-		}
-		switch ev.Op {
-		case "new":
-			s.addWin(ev.ID)
-		case "del":
-			s.delWin(ev.ID)
+		select {
+		case <-s.ctx.Done():
+			return
+		case res := <-ch:
+			if res.err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
+				l.Fatal("acme log", zap.Error(res.err))
+			}
+			switch res.ev.Op {
+			case "new":
+				s.addWin(res.ev.ID)
+			case "del":
+				s.delWin(res.ev.ID)
+			}
+			readNext()
 		}
 	}
 }
