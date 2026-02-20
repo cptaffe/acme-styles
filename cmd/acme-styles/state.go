@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
-	"9fans.net/go/plan9"
-	"9fans.net/go/plan9/client"
 	"github.com/cptaffe/acme-styles/logger"
 	"go.uber.org/zap"
 )
@@ -76,6 +74,12 @@ type WinState struct {
 	prevRuns    []StyleRun
 	pending     *flushMsg
 	flushTimer  *time.Timer
+	// editCh delivers insert/delete events from id/log.  It is nil until the
+	// first layer is created for this window (lazy connection).
+	editCh   <-chan *acme.WinLogEvent
+	// logChanCh receives the editCh once startLogChan's goroutine completes.
+	// It is nil before log tracking starts and nil again once editCh is set.
+	logChanCh chan (<-chan *acme.WinLogEvent)
 }
 
 // submit enqueues fn to run in the window's goroutine.  Returns immediately;
@@ -93,9 +97,9 @@ func (ws *WinState) submit(fn func(*WinState)) {
 const callTimeout = 5 * time.Second
 
 // call enqueues fn and blocks until it has run, ctx is cancelled, or
-// callTimeout elapses.  Callers should treat zero/nil return values from
-// captured variables as indicating that the call did not complete.
-func (ws *WinState) call(fn func(*WinState)) {
+// callTimeout elapses.  Returns true if fn ran to completion, false if the
+// context was cancelled or the timeout elapsed.
+func (ws *WinState) call(fn func(*WinState)) bool {
 	done := make(chan struct{})
 	ws.submit(func(ws *WinState) {
 		fn(ws)
@@ -103,9 +107,12 @@ func (ws *WinState) call(fn func(*WinState)) {
 	})
 	select {
 	case <-done:
+		return true
 	case <-ws.ctx.Done():
+		return false
 	case <-time.After(callTimeout):
 		logger.L(ws.ctx).Warn("call timed out; window goroutine unresponsive")
+		return false
 	}
 }
 
@@ -127,36 +134,27 @@ func (ws *WinState) run() {
 		log.Debug("cleared stale styles")
 	}
 
-	// Edit tracking: open id/log on its own per-window MountService connection
-	// in a background goroutine so that run() enters the select loop
-	// immediately and stays responsive to call(fn) while the mount/open is in
-	// progress.  Using a per-window connection avoids the 9pserve MAXMSG=64
-	// limit: with N windows doing long-polling Tread on a shared connection,
-	// there are only (64-N) slots left for new opens.  Per-window connections
-	// each carry exactly one Tread at steady state.
-	log.Debug("opening log chan")
-	logChanCh := make(chan (<-chan *acme.WinLogEvent), 1)
-	go func() { logChanCh <- ws.startLogChan() }()
-
-	var editCh <-chan *acme.WinLogEvent
+	// Edit tracking is started lazily: id/log is only opened once the first
+	// style layer is created for this window (see maybeStartLog / NewLayer).
+	// Windows with no layers never open a log fid.
 	log.Debug("entering select loop")
 
 	for {
 		select {
-		case ch := <-logChanCh:
-			editCh = ch
-			logChanCh = nil // stop selecting; nil channel blocks forever
-			log.Debug("opened log chan", zap.Bool("ok", editCh != nil))
+		case ch := <-ws.logChanCh:
+			ws.editCh = ch
+			ws.logChanCh = nil // nil channel blocks forever; remove from select
+			log.Debug("opened log chan", zap.Bool("ok", ws.editCh != nil))
 
 		case fn := <-ws.cmdCh:
 			fn(ws)
 
-		case e, ok := <-editCh:
+		case e, ok := <-ws.editCh:
 			if !ok {
 				// Log file closed — window will be deleted shortly via the
 				// global acme log.  Stop tracking edits; keep running so that
 				// in-flight commands still execute.
-				editCh = nil
+				ws.editCh = nil
 				continue
 			}
 			switch e.Op {
@@ -182,33 +180,33 @@ func (ws *WinState) run() {
 	}
 }
 
-// startLogChan opens id/log on the server's dedicated log connection and
-// returns a channel that delivers edit events.  The goroutine exits when the
-// fid returns an error (e.g. because logConn was force-closed at shutdown) or
-// ctx is cancelled.
+// startLogChan opens window ws.ID via acme.Open and returns a channel that
+// delivers per-window body-edit events.  It is called lazily (via
+// maybeStartLog) only when the first layer is created, so windows with no
+// active layers never open a log fid.
+//
+// The goroutine exits when ReadLog returns an error (window deleted or
+// process exiting).  run() exits independently on ctx.Done() and does not
+// depend on this channel closing first.
 func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
 	log := logger.L(ws.ctx)
-	log.Debug("opening log fid")
-	fid, err := ws.srv.logFsys.Open(fmt.Sprintf("%d/log", ws.ID), plan9.OREAD)
+	log.Debug("opening log win")
+	w, err := acme.Open(ws.ID, nil)
 	if err != nil {
-		log.Error("open log", zap.Error(err))
+		log.Error("open win for log", zap.Error(err))
 		return nil
 	}
-	log.Debug("opened log fid")
+	log.Debug("opened log win")
 	ch := make(chan *acme.WinLogEvent)
 	go func() {
-		defer fid.Close()
+		defer w.CloseFiles()
 		defer close(ch)
 		for {
-			e, err := acme.ReadLog(fid)
+			e, err := w.ReadLog()
 			if err != nil {
 				return
 			}
-			select {
-			case ch <- e:
-			case <-ws.ctx.Done():
-				return
-			}
+			ch <- e
 		}
 	}()
 	return ch
@@ -263,15 +261,28 @@ func resetTimer(t *time.Timer, d time.Duration) {
 // ---- public API for 9P handlers (safe to call from any goroutine) ----
 
 // NewLayer allocates a new layer and returns its ID.
-func (ws *WinState) NewLayer() int {
+func (ws *WinState) NewLayer() (int, error) {
 	var id int
-	ws.call(func(ws *WinState) {
+	if !ws.call(func(ws *WinState) {
 		l := &Layer{ID: ws.nextID, Name: strconv.Itoa(ws.nextID)}
 		ws.layers = append(ws.layers, l)
 		id = ws.nextID
 		ws.nextID++
-	})
-	return id
+		ws.maybeStartLog()
+	}) {
+		return 0, fmt.Errorf("new layer: call timeout")
+	}
+	return id, nil
+}
+
+// maybeStartLog starts edit tracking for this window if it hasn't been started
+// yet.  Must be called from within run() (i.e. inside a call/submit closure).
+func (ws *WinState) maybeStartLog() {
+	if ws.logChanCh != nil || ws.editCh != nil {
+		return // already started or starting
+	}
+	ws.logChanCh = make(chan (<-chan *acme.WinLogEvent), 1)
+	go func() { ws.logChanCh <- ws.startLogChan() }()
 }
 
 // LayerExists reports whether a layer with the given ID is present.
@@ -460,27 +471,16 @@ type Config struct {
 type Server struct {
 	masterPalette []PaletteEntry
 	layerOrder    []string
-	// logConn and logFsys are a dedicated acme connection used for all
-	// long-polling id/log Tread calls.  Keeping them on a separate connection
-	// from the main acme fsys prevents log reads from stalling short-lived
-	// Style/Addr writes.  logConn is stored so that Close() can force-close
-	// the underlying socket at shutdown, immediately unblocking all pending
-	// Treads so run() goroutines can exit cleanly.
-	logConn *client.Conn
-	logFsys *client.Fsys
-
-	mu   sync.Mutex
+	mu            sync.Mutex
 	wins map[int]*WinState
 	ctx  context.Context // root context; cancelled on shutdown
 	wg   sync.WaitGroup  // tracks live window goroutines
 }
 
-func newServer(cfg Config, logConn *client.Conn, logFsys *client.Fsys, ctx context.Context) *Server {
+func newServer(cfg Config, ctx context.Context) *Server {
 	return &Server{
 		masterPalette: cfg.Palette,
 		layerOrder:    cfg.LayerOrder,
-		logConn:       logConn,
-		logFsys:       logFsys,
 		wins:          make(map[int]*WinState),
 		ctx:           ctx,
 	}

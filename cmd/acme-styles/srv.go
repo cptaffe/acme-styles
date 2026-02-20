@@ -365,7 +365,10 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		if w == nil {
 			return rerr(fc.Tag, "window gone")
 		}
-		id := w.NewLayer()
+		id, err := w.NewLayer()
+		if err != nil {
+			return rerr(fc.Tag, err.Error())
+		}
 		f.layID = id
 		f.buf = []byte(strconv.Itoa(id) + "\n")
 

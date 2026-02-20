@@ -23,6 +23,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 
 	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
@@ -38,31 +39,59 @@ type Entry struct {
 }
 
 // StyleLayer is a client handle for one named layer in the acme-styles
-// compositor.  Each method mounts acme-styles fresh so the handle survives
-// compositor restarts.  All operations are best-effort: if acme-styles is
-// not reachable they are silently ignored.
+// compositor.  A single 9P connection is shared across all StyleLayer
+// operations in the process and re-established on first use after any
+// error.
 type StyleLayer struct {
 	WinID   int
 	LayerID int
 	name    string // for re-allocation after compositor restart
 }
 
-func mount() (*client.Fsys, error) {
-	return client.MountService("acme-styles")
+// ---- connection management ----
+
+var (
+	connMu sync.Mutex
+	fsys   *client.Fsys
+)
+
+// currentFsys returns the cached connection to acme-styles, connecting
+// on first use or after a previous connection error has been reset.
+func currentFsys() (*client.Fsys, error) {
+	connMu.Lock()
+	defer connMu.Unlock()
+	if fsys != nil {
+		return fsys, nil
+	}
+	fs, err := client.MountService("acme-styles")
+	if err != nil {
+		return nil, err
+	}
+	fsys = fs
+	return fs, nil
 }
+
+// resetFsys clears the cached connection so the next call to currentFsys
+// will reconnect.  Call this when any operation returns a connection error.
+func resetFsys() {
+	connMu.Lock()
+	fsys = nil
+	connMu.Unlock()
+}
+
+// ---- StyleLayer API ----
 
 // Open returns a StyleLayer for the named layer on winID, creating and
 // naming it in the compositor if it does not already exist.
 // Returns an error only if acme-styles is unreachable.
 func Open(winID int, name string) (*StyleLayer, error) {
-	fs, err := mount()
+	fs, err := currentFsys()
 	if err != nil {
 		return nil, err
 	}
-	defer fs.Close()
-
 	layID, err := FindOrCreate(fs, winID, name)
 	if err != nil {
+		resetFsys()
 		return nil, err
 	}
 	return &StyleLayer{WinID: winID, LayerID: layID, name: name}, nil
@@ -75,6 +104,9 @@ func Open(winID int, name string) (*StyleLayer, error) {
 //
 // If the layer is gone (compositor restarted), it is re-allocated first.
 func (sl *StyleLayer) Apply(entries []Entry) error {
+	if sl == nil {
+		return nil
+	}
 	if len(entries) == 0 {
 		sl.Clear()
 		return nil
@@ -96,28 +128,40 @@ func (sl *StyleLayer) Apply(entries []Entry) error {
 //
 // If the layer is gone (compositor restarted), it is re-allocated first.
 func (sl *StyleLayer) Write(text string) error {
-	fs, err := mount()
+	if sl == nil {
+		return nil
+	}
+	fs, err := currentFsys()
 	if err != nil {
 		return err
 	}
-	defer fs.Close()
 
 	stylePath := fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID)
 	fid, err := fs.Open(stylePath, plan9.OWRITE)
 	if err != nil {
-		// Layer gone — compositor restarted.  Re-allocate and retry.
+		resetFsys()
+		// Layer gone — compositor restarted.  Re-allocate and retry once.
+		fs, err = currentFsys()
+		if err != nil {
+			return err
+		}
 		newID, err2 := FindOrCreate(fs, sl.WinID, sl.name)
 		if err2 != nil {
-			return fmt.Errorf("open style: %v; re-alloc: %v", err, err2)
+			resetFsys()
+			return fmt.Errorf("re-alloc layer: %w", err2)
 		}
 		sl.LayerID = newID
 		fid, err = fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID), plan9.OWRITE)
 		if err != nil {
+			resetFsys()
 			return err
 		}
 	}
 	defer fid.Close()
 	_, err = fid.Write([]byte(text))
+	if err != nil {
+		resetFsys()
+	}
 	return err
 }
 
@@ -143,19 +187,21 @@ func (sl *StyleLayer) Delete() {
 
 // ctl writes cmd to the layer's ctl file; best-effort.
 func (sl *StyleLayer) ctl(cmd string) {
-	fs, err := mount()
+	fs, err := currentFsys()
 	if err != nil {
 		return
 	}
-	defer fs.Close()
 	fid, err := fs.Open(
 		fmt.Sprintf("%d/layers/%d/ctl", sl.WinID, sl.LayerID),
 		plan9.OWRITE,
 	)
 	if err != nil {
+		resetFsys()
 		return
 	}
-	fid.Write([]byte(cmd)) //nolint:errcheck
+	if _, err := fid.Write([]byte(cmd)); err != nil {
+		resetFsys()
+	}
 	fid.Close()
 }
 
