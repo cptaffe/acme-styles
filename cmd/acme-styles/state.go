@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,6 +11,8 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
+	"github.com/cptaffe/acme-styles/logger"
+	"go.uber.org/zap"
 )
 
 // PaletteEntry is one named style definition within a layer's palette.
@@ -112,9 +113,10 @@ func (s *Server) addWin(id int) *WinState {
 	defer s.mu.Unlock()
 	if _, ok := s.wins[id]; !ok {
 		ctx, cancel := context.WithCancel(s.ctx)
+		ctx = logger.NewContext(ctx, logger.L(s.ctx).With(zap.Int("window", id)))
 		awin, err := acme.Open(id, nil)
 		if err != nil {
-			log.Printf("addWin %d: %v", id, err)
+			logger.L(ctx).Error("open acme window", zap.Error(err))
 		}
 		ws := &WinState{
 			ID:      id,
@@ -139,7 +141,7 @@ func (ws *WinState) clearStyle() {
 		return
 	}
 	if err := ws.win.Style(nil); err != nil {
-		log.Printf("win %d: clear style: %v", ws.ID, err)
+		logger.L(ws.ctx).Error("clear style", zap.Error(err))
 	}
 }
 
@@ -916,16 +918,16 @@ func (w *WinState) diffAndWrite(oldPal, newPal []PaletteEntry, oldRuns, newRuns 
 		if err := w.win.Addr("#%d,#%d", q0, q1); err != nil {
 			// addr failed; fall back to full write with full data.
 			if err := w.win.Style([]byte(formatStyleFull(newPal, newRuns))); err != nil {
-				log.Printf("win %d: full style write: %v", w.ID, err)
+				logger.L(w.ctx).Error("full style write", zap.Error(err))
 			}
 			return
 		}
 		if err := w.win.Style([]byte(formatStyleAt(newPal, newRuns, q0, q1))); err != nil {
-			log.Printf("win %d: partial style write: %v", w.ID, err)
+			logger.L(w.ctx).Error("partial style write", zap.Error(err))
 		}
 		return
 	}
 	if err := w.win.Style([]byte(formatStyleFull(newPal, newRuns))); err != nil {
-		log.Printf("win %d: full style write: %v", w.ID, err)
+		logger.L(w.ctx).Error("full style write", zap.Error(err))
 	}
 }
