@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"9fans.net/go/acme"
 	"9fans.net/go/plan9/client"
@@ -102,6 +103,11 @@ func main() {
 // Each addWin call starts a window goroutine that clears stale styles and
 // tracks edits; no extra per-window goroutines are needed here.
 //
+// acme.Windows() and acme.Log() are retried with backoff: when the previous
+// process exits abruptly, the 9P proxy (9pserve) may still be sending Tclunk
+// messages for its outstanding fids, leaving acme's fid table temporarily busy.
+// Retrying gives that cleanup time to finish before we give up.
+//
 // lr.Read() is a blocking call; we wrap each call in a goroutine and select
 // against ctx.Done() so that a signal causes a clean exit.  The in-flight
 // goroutine may linger briefly after shutdown — that is fine because the
@@ -109,7 +115,7 @@ func main() {
 func watchLog(s *Server) {
 	l := logger.L(s.ctx)
 
-	wins, err := acme.Windows()
+	wins, err := retryOn(s.ctx, 10, 200*time.Millisecond, acme.Windows)
 	if err != nil {
 		l.Fatal("acme.Windows", zap.Error(err))
 	}
@@ -117,7 +123,7 @@ func watchLog(s *Server) {
 		s.addWin(w.ID)
 	}
 
-	lr, err := acme.Log()
+	lr, err := retryOn(s.ctx, 10, 200*time.Millisecond, acme.Log)
 	if err != nil {
 		l.Fatal("acme.Log", zap.Error(err))
 	}
@@ -157,4 +163,29 @@ func watchLog(s *Server) {
 			readNext()
 		}
 	}
+}
+
+// retryOn calls fn repeatedly until it succeeds, the context is cancelled,
+// or maxAttempts is exhausted.  Between each attempt it waits delay.
+func retryOn[T any](ctx context.Context, maxAttempts int, delay time.Duration, fn func() (T, error)) (T, error) {
+	var (
+		zero T
+		err  error
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var v T
+		v, err = fn()
+		if err == nil {
+			return v, nil
+		}
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return zero, err
 }
