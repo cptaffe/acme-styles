@@ -96,7 +96,15 @@ func main() {
 		go s.handleConn(c)
 	}
 
-	l.Info("shutting down")
+	l.Info("shutting down; waiting for window goroutines")
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		l.Info("shutdown complete")
+	case <-time.After(5 * time.Second):
+		l.Warn("shutdown timed out; exiting anyway")
+	}
 }
 
 // watchLog seeds window state from acme and then streams opens/closes.

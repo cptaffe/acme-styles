@@ -101,6 +101,7 @@ func (ws *WinState) call(fn func(*WinState)) {
 // run is the window goroutine.  It owns all mutable WinState fields and is
 // the only goroutine that touches them.
 func (ws *WinState) run() {
+	defer ws.srv.wg.Done()
 	log := logger.L(ws.ctx)
 
 	ws.flushTimer = time.NewTimer(coalesceDelay)
@@ -406,6 +407,7 @@ type Server struct {
 	mu   sync.Mutex
 	wins map[int]*WinState
 	ctx  context.Context // root context; cancelled on shutdown
+	wg   sync.WaitGroup  // tracks live window goroutines
 }
 
 func newServer(cfg Config, ctx context.Context) *Server {
@@ -464,6 +466,7 @@ func (s *Server) addWin(id int) *WinState {
 	s.wins[id] = ws
 	s.mu.Unlock()
 
+	s.wg.Add(1)
 	go ws.run()
 	return ws
 }
