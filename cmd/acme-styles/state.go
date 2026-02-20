@@ -76,6 +76,12 @@ type WinState struct {
 	prevRuns    []StyleRun
 	pending     *flushMsg
 	flushTimer  *time.Timer
+	// editCh delivers insert/delete events from id/log.  It is nil until the
+	// first layer is created for this window (lazy connection).
+	editCh   <-chan *acme.WinLogEvent
+	// logChanCh receives the editCh once startLogChan's goroutine completes.
+	// It is nil before log tracking starts and nil again once editCh is set.
+	logChanCh chan (<-chan *acme.WinLogEvent)
 }
 
 // submit enqueues fn to run in the window's goroutine.  Returns immediately;
@@ -127,36 +133,28 @@ func (ws *WinState) run() {
 		log.Debug("cleared stale styles")
 	}
 
-	// Edit tracking: open id/log on its own per-window MountService connection
-	// in a background goroutine so that run() enters the select loop
-	// immediately and stays responsive to call(fn) while the mount/open is in
-	// progress.  Using a per-window connection avoids the 9pserve MAXMSG=64
-	// limit: with N windows doing long-polling Tread on a shared connection,
-	// there are only (64-N) slots left for new opens.  Per-window connections
-	// each carry exactly one Tread at steady state.
-	log.Debug("opening log chan")
-	logChanCh := make(chan (<-chan *acme.WinLogEvent), 1)
-	go func() { logChanCh <- ws.startLogChan() }()
-
-	var editCh <-chan *acme.WinLogEvent
+	// Edit tracking is started lazily: id/log is only opened once the first
+	// style layer is created for this window (see maybeStartLog / NewLayer).
+	// Windows with no layers never open a log fid, keeping logFsys load
+	// proportional to active windows rather than total windows.
 	log.Debug("entering select loop")
 
 	for {
 		select {
-		case ch := <-logChanCh:
-			editCh = ch
-			logChanCh = nil // stop selecting; nil channel blocks forever
-			log.Debug("opened log chan", zap.Bool("ok", editCh != nil))
+		case ch := <-ws.logChanCh:
+			ws.editCh = ch
+			ws.logChanCh = nil // nil channel blocks forever; remove from select
+			log.Debug("opened log chan", zap.Bool("ok", ws.editCh != nil))
 
 		case fn := <-ws.cmdCh:
 			fn(ws)
 
-		case e, ok := <-editCh:
+		case e, ok := <-ws.editCh:
 			if !ok {
 				// Log file closed — window will be deleted shortly via the
 				// global acme log.  Stop tracking edits; keep running so that
 				// in-flight commands still execute.
-				editCh = nil
+				ws.editCh = nil
 				continue
 			}
 			switch e.Op {
@@ -183,8 +181,10 @@ func (ws *WinState) run() {
 }
 
 // startLogChan opens id/log on the server's dedicated log connection and
-// returns a channel that delivers edit events.  The goroutine exits when the
-// fid returns an error (e.g. because logConn was force-closed at shutdown) or
+// returns a channel that delivers edit events.  It is called lazily (via
+// maybeStartLog) only when the first layer is created, so windows with no
+// active layers never open a log fid.  The goroutine exits when the fid
+// returns an error (e.g. because logConn was force-closed at shutdown) or
 // ctx is cancelled.
 func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
 	log := logger.L(ws.ctx)
@@ -270,8 +270,19 @@ func (ws *WinState) NewLayer() int {
 		ws.layers = append(ws.layers, l)
 		id = ws.nextID
 		ws.nextID++
+		ws.maybeStartLog()
 	})
 	return id
+}
+
+// maybeStartLog starts edit tracking for this window if it hasn't been started
+// yet.  Must be called from within run() (i.e. inside a call/submit closure).
+func (ws *WinState) maybeStartLog() {
+	if ws.logChanCh != nil || ws.editCh != nil {
+		return // already started or starting
+	}
+	ws.logChanCh = make(chan (<-chan *acme.WinLogEvent), 1)
+	go func() { ws.logChanCh <- ws.startLogChan() }()
 }
 
 // LayerExists reports whether a layer with the given ID is present.
