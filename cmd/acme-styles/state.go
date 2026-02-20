@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"9fans.net/go/acme"
-	"9fans.net/go/plan9"
-	"9fans.net/go/plan9/client"
 	"github.com/cptaffe/acme-styles/logger"
 	"go.uber.org/zap"
 )
@@ -127,15 +125,27 @@ func (ws *WinState) run() {
 		log.Debug("cleared stale styles")
 	}
 
-	// Edit tracking: open id/log on the dedicated logFsys so that long-polling
-	// Tread calls do not share the muxer with short-lived Style/Addr writes.
+	// Edit tracking: open id/log on its own per-window MountService connection
+	// in a background goroutine so that run() enters the select loop
+	// immediately and stays responsive to call(fn) while the mount/open is in
+	// progress.  Using a per-window connection avoids the 9pserve MAXMSG=64
+	// limit: with N windows doing long-polling Tread on a shared connection,
+	// there are only (64-N) slots left for new opens.  Per-window connections
+	// each carry exactly one Tread at steady state.
 	log.Debug("opening log chan")
-	editCh := ws.startLogChan()
-	log.Debug("opened log chan", zap.Bool("ok", editCh != nil))
+	logChanCh := make(chan (<-chan *acme.WinLogEvent), 1)
+	go func() { logChanCh <- ws.startLogChan() }()
+
+	var editCh <-chan *acme.WinLogEvent
 	log.Debug("entering select loop")
 
 	for {
 		select {
+		case ch := <-logChanCh:
+			editCh = ch
+			logChanCh = nil // stop selecting; nil channel blocks forever
+			log.Debug("opened log chan", zap.Bool("ok", editCh != nil))
+
 		case fn := <-ws.cmdCh:
 			fn(ws)
 
@@ -170,19 +180,16 @@ func (ws *WinState) run() {
 	}
 }
 
-// startLogChan opens id/log on the server's dedicated log connection and
-// returns a channel that delivers edit events.  The goroutine exits when the
-// fid is closed (acme deleted the window) or ctx is cancelled.
+// startLogChan acquires a slot from the server's log connection pool, opens
+// id/log on it, and returns a channel that delivers edit events.
 //
-// Using a separate Fsys for log reads prevents the long-polling Tread from
-// holding the shared-fsys muxer and stalling Style/Addr writes.
+// The pool keeps each connection's outstanding Tread count below
+// logPoolMaxLoad (48), leaving headroom under 9pserve's MAXMSG=64 limit for
+// the transient Walk+Open messages needed at startup.
 func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
 	log := logger.L(ws.ctx)
-	if ws.srv.logFsys == nil {
-		return nil
-	}
 	log.Debug("opening log fid")
-	fid, err := ws.srv.logFsys.Open(fmt.Sprintf("%d/log", ws.ID), plan9.OREAD)
+	fid, release, err := ws.srv.logPool.open(ws.ID)
 	if err != nil {
 		log.Error("open log", zap.Error(err))
 		return nil
@@ -190,6 +197,7 @@ func (ws *WinState) startLogChan() <-chan *acme.WinLogEvent {
 	log.Debug("opened log fid")
 	ch := make(chan *acme.WinLogEvent)
 	go func() {
+		defer release()
 		defer fid.Close()
 		defer close(ch)
 		for {
@@ -453,12 +461,7 @@ type Config struct {
 type Server struct {
 	masterPalette []PaletteEntry
 	layerOrder    []string
-
-	// logFsys is a dedicated acme connection used exclusively for per-window
-	// long-polling Tread calls on id/log.  Keeping log reads on a separate
-	// connection prevents them from holding the shared-fsys muxer and blocking
-	// short-lived Style/Addr calls.
-	logFsys *client.Fsys
+	logPool       *logPool // pool of acme connections for long-polling log reads
 
 	mu   sync.Mutex
 	wins map[int]*WinState
@@ -466,11 +469,11 @@ type Server struct {
 	wg   sync.WaitGroup  // tracks live window goroutines
 }
 
-func newServer(cfg Config, logFsys *client.Fsys, ctx context.Context) *Server {
+func newServer(cfg Config, ctx context.Context) *Server {
 	return &Server{
 		masterPalette: cfg.Palette,
 		layerOrder:    cfg.LayerOrder,
-		logFsys:       logFsys,
+		logPool:       newLogPool(),
 		wins:          make(map[int]*WinState),
 		ctx:           ctx,
 	}

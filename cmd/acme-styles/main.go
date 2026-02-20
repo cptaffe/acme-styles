@@ -64,17 +64,7 @@ func main() {
 	defer stop()
 	ctx = logger.NewContext(ctx, l)
 
-	// Dedicated connection for per-window log reads.  Keeping long-polling
-	// Tread calls on a separate Fsys prevents them from holding the muxer on
-	// the shared acme connection and stalling Style/Addr writes.
-	logFsys, err := retryOn(ctx, 10, 200*time.Millisecond, func() (*client.Fsys, error) {
-		return client.MountService("acme")
-	})
-	if err != nil {
-		l.Fatal("mount acme (log)", zap.Error(err))
-	}
-
-	s := newServer(cfg, logFsys, ctx)
+	s := newServer(cfg, ctx)
 	go watchLog(s)
 
 	os.Remove(srvPath)
@@ -107,10 +97,11 @@ func main() {
 	}
 
 	l.Info("shutting down; waiting for window goroutines")
-	// Close the log connection first: this unblocks all pending Tread calls,
-	// causing every startLogChan goroutine to exit and close its channel.
-	// run() then sees ctx.Done() and calls CloseFiles() before returning.
-	logFsys.Close()
+	// Close the log pool first: this closes every pooled acme connection,
+	// causing all pending long-polling Tread calls to fail immediately.
+	// The startLogChan goroutines then exit, close their channels, and
+	// run() goroutines see ctx.Done() → CloseFiles() → wg.Done().
+	s.logPool.Close()
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
 	select {
