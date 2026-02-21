@@ -2,13 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"log"
-	"net"
 	"os"
 	"os/signal"
-	"syscall"
 	"time"
 
 	"9fans.net/go/acme"
@@ -17,15 +14,9 @@ import (
 	"go.uber.org/zap"
 )
 
-// Sentinel walk errors.
-var (
-	ErrNoFile = errors.New("no such file")
-	ErrNotDir = errors.New("not a directory")
-)
-
 func main() {
 	stylesFile := flag.String("styles", "", "master palette file (new :name format)")
-	srv := flag.String("srv", "", "unix socket path (default: $NAMESPACE/acme-styles)")
+	srv := flag.String("srv", "", "service path (default: $NAMESPACE/acme-styles)")
 	verbose := flag.Bool("v", false, "verbose logging")
 	flag.Parse()
 
@@ -42,6 +33,8 @@ func main() {
 	zap.ReplaceGlobals(l)
 	defer l.Sync() //nolint:errcheck
 
+	// client.Namespace() returns /srv on Plan 9 and the $NAMESPACE dir
+	// on other systems, so this default is correct on both.
 	srvPath := *srv
 	if srvPath == "" {
 		srvPath = client.Namespace() + "/acme-styles"
@@ -60,41 +53,24 @@ func main() {
 			zap.String("path", *stylesFile))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
 	ctx = logger.NewContext(ctx, l)
 
 	s := newServer(cfg, ctx)
 	go watchLog(s)
 
-	os.Remove(srvPath)
-	ln, err := net.Listen("unix", srvPath)
+	conn, cleanup, err := listen(srvPath)
 	if err != nil {
 		l.Fatal("listen", zap.String("path", srvPath), zap.Error(err))
 	}
-	defer os.Remove(srvPath)
-	defer ln.Close()
-
-	// Close the listener when the context is cancelled so that Accept
-	// returns an error and the loop below can exit.
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		cleanup()
 	}()
 
-	l.Info("listening", zap.String("addr", srvPath))
-
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			l.Error("accept", zap.Error(err))
-			continue
-		}
-		go s.handleConn(c)
-	}
+	l.Info("serving", zap.String("path", srvPath))
+	s.buildSrv9p().Serve(conn, conn)
 
 	l.Info("shutting down; waiting for window goroutines")
 	done := make(chan struct{})
@@ -108,18 +84,6 @@ func main() {
 }
 
 // watchLog seeds window state from acme and then streams opens/closes.
-// Each addWin call starts a window goroutine that clears stale styles and
-// tracks edits; no extra per-window goroutines are needed here.
-//
-// acme.Windows() and acme.Log() are retried with backoff: when the previous
-// process exits abruptly, the 9P proxy (9pserve) may still be sending Tclunk
-// messages for its outstanding fids, leaving acme's fid table temporarily busy.
-// Retrying gives that cleanup time to finish before we give up.
-//
-// lr.Read() is a blocking call; we wrap each call in a goroutine and select
-// against ctx.Done() so that a signal causes a clean exit.  The in-flight
-// goroutine may linger briefly after shutdown — that is fine because the
-// process is about to exit.
 func watchLog(s *Server) {
 	l := logger.L(s.ctx)
 
@@ -174,7 +138,7 @@ func watchLog(s *Server) {
 }
 
 // retryOn calls fn repeatedly until it succeeds, the context is cancelled,
-// or maxAttempts is exhausted.  Between each attempt it waits delay.
+// or maxAttempts is exhausted.
 func retryOn[T any](ctx context.Context, maxAttempts int, delay time.Duration, fn func() (T, error)) (T, error) {
 	var (
 		zero T

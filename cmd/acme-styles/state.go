@@ -34,11 +34,18 @@ type StyleRun struct {
 }
 
 // Layer is a named collection of palette entries and style runs.
+// hasAddr/addrQ0/addrQ1 mirror acme's w->hasaddr and w->addr: they are set
+// when the layer's addr file is written, cleared when addr is opened
+// (nopen 0→1 reset) or consumed at style-open time.
 type Layer struct {
 	ID      int
 	Name    string
 	Palette []PaletteEntry
 	Runs    []StyleRun
+
+	hasAddr bool
+	addrQ0  int
+	addrQ1  int
 }
 
 // coalesceDelay is the window during which multiple flush triggers are batched
@@ -351,6 +358,54 @@ func (ws *WinState) LayerName(layID int) string {
 		}
 	})
 	return name
+}
+
+// ResetAddr clears the pending addr for layID, matching acme's behaviour of
+// resetting w->addr and w->hasaddr when the addr file is opened for the first
+// time (nopen[QWaddr] 0→1).
+func (ws *WinState) ResetAddr(layID int) {
+	ws.submit(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				l.hasAddr = false
+				l.addrQ0, l.addrQ1 = 0, 0
+				return
+			}
+		}
+	})
+}
+
+// SetAddr records a pending partial-write address for layID, matching acme's
+// behaviour of setting w->hasaddr and w->addr on each write to the addr file.
+func (ws *WinState) SetAddr(layID int, q0, q1 int) {
+	ws.submit(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				l.hasAddr = true
+				l.addrQ0 = q0
+				l.addrQ1 = q1
+				return
+			}
+		}
+	})
+}
+
+// ConsumeAddr captures and clears the pending addr for layID, matching acme's
+// behaviour of reading w->hasaddr/w->addr into the fid at style Topen time
+// and immediately clearing w->hasaddr.  Returns ok=false when no addr is
+// pending (full-replace mode).
+func (ws *WinState) ConsumeAddr(layID int) (q0, q1 int, ok bool) {
+	ws.call(func(ws *WinState) {
+		for _, l := range ws.layers {
+			if l.ID == layID {
+				q0, q1, ok = l.addrQ0, l.addrQ1, l.hasAddr
+				l.hasAddr = false
+				l.addrQ0, l.addrQ1 = 0, 0
+				return
+			}
+		}
+	})
+	return
 }
 
 // SetLayerName renames a layer.
