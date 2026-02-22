@@ -40,43 +40,37 @@ type Entry = style.StyleRun
 
 // StyleLayer is a client handle for one named layer in the acme-styles
 // compositor.  A single 9P connection is shared across all StyleLayer
-// operations in the process and re-established on first use after any
-// error.
+// operations in the process, established lazily on first use via sync.Once.
 type StyleLayer struct {
 	WinID   int
 	LayerID int
-	name    string // for re-allocation after compositor restart
+	name    string
 }
 
 // ---- connection management ----
 
 var (
-	connMu sync.Mutex
-	fsys   *client.Fsys
+	mountOnce sync.Once
+	fsys      *client.Fsys
+	mountErr  error
 )
 
-// currentFsys returns the cached connection to acme-styles, connecting
-// on first use or after a previous connection error has been reset.
-func currentFsys() (*client.Fsys, error) {
-	connMu.Lock()
-	defer connMu.Unlock()
-	if fsys != nil {
-		return fsys, nil
-	}
+// mountAcmeStyles is called once by mountOnce to establish the shared
+// connection to acme-styles.
+func mountAcmeStyles() {
 	fs, err := client.MountService("acme-styles")
 	if err != nil {
-		return nil, err
+		mountErr = err
+		return
 	}
 	fsys = fs
-	return fs, nil
 }
 
-// resetFsys clears the cached connection so the next call to currentFsys
-// will reconnect.  Call this when any operation returns a connection error.
-func resetFsys() {
-	connMu.Lock()
-	fsys = nil
-	connMu.Unlock()
+// defaultFsys returns the shared connection to acme-styles, establishing
+// it on first call.
+func defaultFsys() (*client.Fsys, error) {
+	mountOnce.Do(mountAcmeStyles)
+	return fsys, mountErr
 }
 
 // ---- StyleLayer API ----
@@ -85,13 +79,12 @@ func resetFsys() {
 // naming it in the compositor if it does not already exist.
 // Returns an error only if acme-styles is unreachable.
 func Open(winID int, name string) (*StyleLayer, error) {
-	fs, err := currentFsys()
+	fs, err := defaultFsys()
 	if err != nil {
 		return nil, err
 	}
 	layID, err := FindOrCreate(fs, winID, name)
 	if err != nil {
-		resetFsys()
 		return nil, err
 	}
 	return &StyleLayer{WinID: winID, LayerID: layID, name: name}, nil
@@ -101,7 +94,7 @@ func Open(winID int, name string) (*StyleLayer, error) {
 // exists in the compositor.  Returns nil, false if the compositor is
 // unreachable or no layer with that name exists.
 func FindLayer(winID int, name string) (*StyleLayer, bool) {
-	fs, err := currentFsys()
+	fs, err := defaultFsys()
 	if err != nil {
 		return nil, false
 	}
@@ -116,8 +109,6 @@ func FindLayer(winID int, name string) (*StyleLayer, bool) {
 // palette (defined in ~/lib/acme/styles) for colour/font information.
 // Opening the layer's style file OWRITE causes acme-styles to clear and
 // replace its contents atomically; a compositor flush fires at fid clunk.
-//
-// If the layer is gone (compositor restarted), it is re-allocated first.
 func (sl *StyleLayer) Apply(entries []Entry) error {
 	if sl == nil {
 		return nil
@@ -140,43 +131,21 @@ func (sl *StyleLayer) Apply(entries []Entry) error {
 //
 // Use Write instead of Apply when the tool needs to supply its own
 // palette definitions rather than relying on the master palette.
-//
-// If the layer is gone (compositor restarted), it is re-allocated first.
 func (sl *StyleLayer) Write(text string) error {
 	if sl == nil {
 		return nil
 	}
-	fs, err := currentFsys()
+	fs, err := defaultFsys()
 	if err != nil {
 		return err
 	}
 
-	stylePath := fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID)
-	fid, err := fs.Open(stylePath, plan9.OWRITE)
+	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID), plan9.OWRITE)
 	if err != nil {
-		resetFsys()
-		// Layer gone — compositor restarted.  Re-allocate and retry once.
-		fs, err = currentFsys()
-		if err != nil {
-			return err
-		}
-		newID, err2 := FindOrCreate(fs, sl.WinID, sl.name)
-		if err2 != nil {
-			resetFsys()
-			return fmt.Errorf("re-alloc layer: %w", err2)
-		}
-		sl.LayerID = newID
-		fid, err = fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID), plan9.OWRITE)
-		if err != nil {
-			resetFsys()
-			return err
-		}
+		return err
 	}
 	defer fid.Close()
 	_, err = fid.Write([]byte(text))
-	if err != nil {
-		resetFsys()
-	}
 	return err
 }
 
@@ -194,7 +163,7 @@ func (sl *StyleLayer) WriteAt(q0, q1 int, text string) error {
 	if sl == nil {
 		return nil
 	}
-	fs, err := currentFsys()
+	fs, err := defaultFsys()
 	if err != nil {
 		return err
 	}
@@ -202,27 +171,21 @@ func (sl *StyleLayer) WriteAt(q0, q1 int, text string) error {
 	// Write addr first — the compositor captures it when style is opened.
 	addrFid, err := fs.Open(fmt.Sprintf("%d/layers/%d/addr", sl.WinID, sl.LayerID), plan9.OWRITE)
 	if err != nil {
-		resetFsys()
 		return fmt.Errorf("open addr: %w", err)
 	}
 	_, werr := fmt.Fprintf(addrFid, "%d %d", q0, q1)
 	addrFid.Close()
 	if werr != nil {
-		resetFsys()
 		return fmt.Errorf("write addr: %w", werr)
 	}
 
 	// Open style — addr is captured at Topen.
 	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID), plan9.OWRITE)
 	if err != nil {
-		resetFsys()
 		return fmt.Errorf("open style: %w", err)
 	}
 	_, err = fid.Write([]byte(text))
 	fid.Close()
-	if err != nil {
-		resetFsys()
-	}
 	return err
 }
 
@@ -248,7 +211,7 @@ func (sl *StyleLayer) Delete() {
 
 // ctl writes cmd to the layer's ctl file; best-effort.
 func (sl *StyleLayer) ctl(cmd string) {
-	fs, err := currentFsys()
+	fs, err := defaultFsys()
 	if err != nil {
 		return
 	}
@@ -257,12 +220,9 @@ func (sl *StyleLayer) ctl(cmd string) {
 		plan9.OWRITE,
 	)
 	if err != nil {
-		resetFsys()
 		return
 	}
-	if _, err := fid.Write([]byte(cmd)); err != nil {
-		resetFsys()
-	}
+	fid.Write([]byte(cmd)) //nolint:errcheck
 	fid.Close()
 }
 
