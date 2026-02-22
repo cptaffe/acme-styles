@@ -31,6 +31,7 @@ const (
 	ftCtl       = 7
 	ftStyle     = 8
 	ftAddr      = 9
+	ftComposed  = 10 // <winid>/style — last compositor output written to acme
 )
 
 func isDir(ft int) bool {
@@ -84,6 +85,9 @@ func (s *Server) makeDir(ft, winID, layID int) plan9.Dir {
 	case ftAddr:
 		name = "addr"
 		mode = 0222
+	case ftComposed:
+		name = "style"
+		mode = 0444
 	}
 	return plan9.Dir{
 		Qid:   s.makeQID(ft, winID, layID),
@@ -118,8 +122,11 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 		}
 		return ftWinDir, id, 0, nil
 	case ftWinDir:
-		if name == "layers" {
+		switch name {
+		case "layers":
 			return ftLayersDir, winID, 0, nil
+		case "style":
+			return ftComposed, winID, 0, nil
 		}
 		return 0, 0, 0, ErrNoFile
 	case ftLayersDir:
@@ -165,6 +172,7 @@ func (s *Server) buildReadDir(ft, winID, layID int) []byte {
 		}
 	case ftWinDir:
 		dirs = append(dirs, s.makeDir(ftLayersDir, winID, 0))
+		dirs = append(dirs, s.makeDir(ftComposed, winID, 0))
 	case ftLayersDir:
 		dirs = append(dirs, s.makeDir(ftNew, winID, 0))
 		dirs = append(dirs, s.makeDir(ftIndex, winID, 0))
@@ -309,6 +317,14 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 		// (analogous to w->addr = range(0,0) when nopen[QWaddr]++ == 0).
 		if w := s.getWin(a.winID); w != nil {
 			w.ResetAddr(a.layID)
+		}
+
+	case ftComposed:
+		if m != plan9.OREAD {
+			return fmt.Errorf("permission denied")
+		}
+		if w := s.getWin(a.winID); w != nil {
+			a.rbuf = []byte(w.ComposedText())
 		}
 
 	case ftStyle:

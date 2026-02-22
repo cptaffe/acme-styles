@@ -332,6 +332,17 @@ func (ws *WinState) IndexText() string {
 	return result
 }
 
+// ComposedText returns the last style content that was written to acme —
+// i.e. the compositor's most recent full-replacement output for this window.
+// Returns an empty string if no flush has happened yet.
+func (ws *WinState) ComposedText() string {
+	var result string
+	ws.call(func(ws *WinState) {
+		result = formatStyleFull(ws.prevPalette, ws.prevRuns)
+	})
+	return result
+}
+
 // StyleText returns the serialized palette+runs for one layer.
 func (ws *WinState) StyleText(layID int) string {
 	var result string
@@ -852,6 +863,16 @@ func compose(master []PaletteEntry, order []string, layers []*Layer) ([]PaletteE
 
 	palette, renameMaps := mergePalettes(master, layers)
 
+	// Build a set of known palette names so that runs referencing undefined
+	// entries can be skipped.  An undefined run would otherwise override a
+	// lower-priority layer's run with "base" (the fall-through in winparsestyle)
+	// rather than being transparent.  For example, an LSP "namespace" token
+	// that has no palette entry should not occlude treesitter's "string" span.
+	paletteNames := make(map[string]bool, len(palette))
+	for _, e := range palette {
+		paletteNames[e.Name] = true
+	}
+
 	type event struct {
 		pos      int
 		layerIdx int
@@ -871,6 +892,11 @@ func compose(master []PaletteEntry, order []string, layers []*Layer) ([]PaletteE
 				if renamed, ok := rm[r.Name]; ok {
 					name = renamed
 				}
+			}
+			// Skip runs whose style name is not in the merged palette —
+			// they have no visual definition and should be transparent.
+			if !paletteNames[name] {
+				continue
 			}
 			events = append(events, event{r.Start, li, name, false})
 			events = append(events, event{r.End, li, name, true})
