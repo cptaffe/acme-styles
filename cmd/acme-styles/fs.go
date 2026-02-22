@@ -11,6 +11,8 @@ import (
 
 	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/srv9p"
+	"github.com/cptaffe/acme-styles/internal/server"
+	"github.com/cptaffe/acme-styles/style"
 )
 
 // Sentinel walk errors.
@@ -43,7 +45,12 @@ func makePath(ft, winID, layID int) uint64 {
 	return (uint64(ft) << 48) | (uint64(winID) << 24) | uint64(layID)
 }
 
-func (s *Server) makeQID(ft, winID, layID int) plan9.Qid {
+// fsServer wraps server.Server with the 9P virtual filesystem implementation.
+type fsServer struct {
+	s *server.Server
+}
+
+func (fs *fsServer) makeQID(ft, winID, layID int) plan9.Qid {
 	qt := uint8(plan9.QTFILE)
 	if isDir(ft) {
 		qt = plan9.QTDIR
@@ -51,7 +58,7 @@ func (s *Server) makeQID(ft, winID, layID int) plan9.Qid {
 	return plan9.Qid{Type: qt, Path: makePath(ft, winID, layID)}
 }
 
-func (s *Server) makeDir(ft, winID, layID int) plan9.Dir {
+func (fs *fsServer) makeDir(ft, winID, layID int) plan9.Dir {
 	now := uint32(time.Now().Unix())
 	var name string
 	var mode plan9.Perm
@@ -90,7 +97,7 @@ func (s *Server) makeDir(ft, winID, layID int) plan9.Dir {
 		mode = 0444
 	}
 	return plan9.Dir{
-		Qid:   s.makeQID(ft, winID, layID),
+		Qid:   fs.makeQID(ft, winID, layID),
 		Mode:  mode,
 		Atime: now, Mtime: now,
 		Name: name,
@@ -99,7 +106,7 @@ func (s *Server) makeDir(ft, winID, layID int) plan9.Dir {
 }
 
 // walkStep advances one path component from (ft, winID, layID).
-func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, error) {
+func (fs *fsServer) walkStep(ft, winID, layID int, name string) (int, int, int, error) {
 	if name == ".." {
 		switch ft {
 		case ftRoot:
@@ -140,7 +147,7 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 		if err != nil {
 			return 0, 0, 0, ErrNoFile
 		}
-		w := s.getWin(winID)
+		w := fs.s.GetWin(winID)
 		if w == nil || !w.LayerExists(id) {
 			return 0, 0, 0, ErrNoFile
 		}
@@ -163,29 +170,29 @@ func (s *Server) walkStep(ft, winID, layID int, name string) (int, int, int, err
 }
 
 // buildReadDir returns pre-marshalled plan9.Dir entries for a directory fid.
-func (s *Server) buildReadDir(ft, winID, layID int) []byte {
+func (fs *fsServer) buildReadDir(ft, winID, layID int) []byte {
 	var dirs []plan9.Dir
 	switch ft {
 	case ftRoot:
-		for _, id := range s.winIDs() {
-			dirs = append(dirs, s.makeDir(ftWinDir, id, 0))
+		for _, id := range fs.s.WinIDs() {
+			dirs = append(dirs, fs.makeDir(ftWinDir, id, 0))
 		}
 	case ftWinDir:
-		dirs = append(dirs, s.makeDir(ftLayersDir, winID, 0))
-		dirs = append(dirs, s.makeDir(ftComposed, winID, 0))
+		dirs = append(dirs, fs.makeDir(ftLayersDir, winID, 0))
+		dirs = append(dirs, fs.makeDir(ftComposed, winID, 0))
 	case ftLayersDir:
-		dirs = append(dirs, s.makeDir(ftNew, winID, 0))
-		dirs = append(dirs, s.makeDir(ftIndex, winID, 0))
-		if w := s.getWin(winID); w != nil {
+		dirs = append(dirs, fs.makeDir(ftNew, winID, 0))
+		dirs = append(dirs, fs.makeDir(ftIndex, winID, 0))
+		if w := fs.s.GetWin(winID); w != nil {
 			for _, id := range w.LayerIDs() {
-				dirs = append(dirs, s.makeDir(ftLayerDir, winID, id))
+				dirs = append(dirs, fs.makeDir(ftLayerDir, winID, id))
 			}
 		}
 	case ftLayerDir:
-		dirs = append(dirs, s.makeDir(ftName, winID, layID))
-		dirs = append(dirs, s.makeDir(ftCtl, winID, layID))
-		dirs = append(dirs, s.makeDir(ftStyle, winID, layID))
-		dirs = append(dirs, s.makeDir(ftAddr, winID, layID))
+		dirs = append(dirs, fs.makeDir(ftName, winID, layID))
+		dirs = append(dirs, fs.makeDir(ftCtl, winID, layID))
+		dirs = append(dirs, fs.makeDir(ftStyle, winID, layID))
+		dirs = append(dirs, fs.makeDir(ftAddr, winID, layID))
 	}
 	var buf []byte
 	for _, d := range dirs {
@@ -212,28 +219,28 @@ type fidAux struct {
 
 // buildSrv9p constructs the srv9p.Server whose callbacks implement the
 // acme-styles virtual filesystem.
-func (s *Server) buildSrv9p() *srv9p.Server {
+func (fs *fsServer) buildSrv9p() *srv9p.Server {
 	return &srv9p.Server{
 		Attach: func(ctx context.Context, fid, _ *srv9p.Fid, _, _ string) (plan9.Qid, error) {
-			qid := s.makeQID(ftRoot, 0, 0)
+			qid := fs.makeQID(ftRoot, 0, 0)
 			fid.SetAux(&fidAux{ft: ftRoot})
 			fid.SetQid(qid)
 			return qid, nil
 		},
-		Walk:  s.srvWalk,
-		Open:  s.srvOpen,
-		Read:  s.srvRead,
-		Write: s.srvWrite,
+		Walk:  fs.srvWalk,
+		Open:  fs.srvOpen,
+		Read:  fs.srvRead,
+		Write: fs.srvWrite,
 		Stat: func(ctx context.Context, fid *srv9p.Fid) (*plan9.Dir, error) {
 			a := fid.Aux().(*fidAux)
-			d := s.makeDir(a.ft, a.winID, a.layID)
+			d := fs.makeDir(a.ft, a.winID, a.layID)
 			return &d, nil
 		},
-		Clunk: s.srvClunk,
+		Clunk: fs.srvClunk,
 	}
 }
 
-func (s *Server) srvWalk(ctx context.Context, fid, newfid *srv9p.Fid, names []string) ([]plan9.Qid, error) {
+func (fs *fsServer) srvWalk(ctx context.Context, fid, newfid *srv9p.Fid, names []string) ([]plan9.Qid, error) {
 	a := fid.Aux().(*fidAux)
 
 	// Clone: copy position to newfid and return empty qids.
@@ -246,14 +253,14 @@ func (s *Server) srvWalk(ctx context.Context, fid, newfid *srv9p.Fid, names []st
 	curFt, curWin, curLay := a.ft, a.winID, a.layID
 	var qids []plan9.Qid
 	for i, name := range names {
-		nft, nwin, nlay, err := s.walkStep(curFt, curWin, curLay, name)
+		nft, nwin, nlay, err := fs.walkStep(curFt, curWin, curLay, name)
 		if err != nil {
 			if i == 0 {
 				return nil, err
 			}
 			break
 		}
-		qids = append(qids, s.makeQID(nft, nwin, nlay))
+		qids = append(qids, fs.makeQID(nft, nwin, nlay))
 		curFt, curWin, curLay = nft, nwin, nlay
 	}
 
@@ -262,20 +269,20 @@ func (s *Server) srvWalk(ctx context.Context, fid, newfid *srv9p.Fid, names []st
 	return qids, nil
 }
 
-func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error {
+func (fs *fsServer) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error {
 	a := fid.Aux().(*fidAux)
 	m := mode & 3
 
 	switch a.ft {
 	case ftRoot, ftWinDir, ftLayersDir, ftLayerDir:
 		// Directories are read-only; eagerly build their listing.
-		a.rbuf = s.buildReadDir(a.ft, a.winID, a.layID)
+		a.rbuf = fs.buildReadDir(a.ft, a.winID, a.layID)
 
 	case ftNew:
 		if m != plan9.OREAD {
 			return fmt.Errorf("permission denied")
 		}
-		w := s.getWin(a.winID)
+		w := fs.s.GetWin(a.winID)
 		if w == nil {
 			return fmt.Errorf("window gone")
 		}
@@ -284,14 +291,14 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 			return err
 		}
 		a.layID = id
-		fid.SetQid(s.makeQID(ftNew, a.winID, id))
+		fid.SetQid(fs.makeQID(ftNew, a.winID, id))
 		a.rbuf = []byte(strconv.Itoa(id) + "\n")
 
 	case ftIndex:
 		if m != plan9.OREAD {
 			return fmt.Errorf("permission denied")
 		}
-		w := s.getWin(a.winID)
+		w := fs.s.GetWin(a.winID)
 		if w == nil {
 			return fmt.Errorf("window gone")
 		}
@@ -299,7 +306,7 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 
 	case ftName:
 		if m == plan9.OREAD || m == plan9.ORDWR {
-			if w := s.getWin(a.winID); w != nil {
+			if w := fs.s.GetWin(a.winID); w != nil {
 				a.rbuf = []byte(w.LayerName(a.layID) + "\n")
 			}
 		}
@@ -315,7 +322,7 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 		}
 		// Matches acme xfid.c QWaddr Topen: reset pending addr on first open
 		// (analogous to w->addr = range(0,0) when nopen[QWaddr]++ == 0).
-		if w := s.getWin(a.winID); w != nil {
+		if w := fs.s.GetWin(a.winID); w != nil {
 			w.ResetAddr(a.layID)
 		}
 
@@ -323,13 +330,13 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 		if m != plan9.OREAD {
 			return fmt.Errorf("permission denied")
 		}
-		if w := s.getWin(a.winID); w != nil {
+		if w := fs.s.GetWin(a.winID); w != nil {
 			a.rbuf = []byte(w.ComposedText())
 		}
 
 	case ftStyle:
 		if m == plan9.OREAD || m == plan9.ORDWR {
-			if w := s.getWin(a.winID); w != nil {
+			if w := fs.s.GetWin(a.winID); w != nil {
 				a.rbuf = []byte(w.StyleText(a.layID))
 			}
 		}
@@ -337,7 +344,7 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 			// Matches acme xfid.c QWstyle Topen: capture and clear the layer's
 			// pending addr into the fid (analogous to copying w->hasaddr/w->addr
 			// into x->f->stylehasaddr/x->f->styleaddr and clearing w->hasaddr).
-			if w := s.getWin(a.winID); w != nil {
+			if w := fs.s.GetWin(a.winID); w != nil {
 				a.addrQ0, a.addrQ1, a.hasAddr = w.ConsumeAddr(a.layID)
 			}
 		}
@@ -346,12 +353,12 @@ func (s *Server) srvOpen(ctx context.Context, fid *srv9p.Fid, mode uint8) error 
 	return nil
 }
 
-func (s *Server) srvRead(ctx context.Context, fid *srv9p.Fid, data []byte, offset int64) (int, error) {
+func (fs *fsServer) srvRead(ctx context.Context, fid *srv9p.Fid, data []byte, offset int64) (int, error) {
 	a := fid.Aux().(*fidAux)
 	return fid.ReadBytes(data, offset, a.rbuf)
 }
 
-func (s *Server) srvWrite(ctx context.Context, fid *srv9p.Fid, data []byte, offset int64) (int, error) {
+func (fs *fsServer) srvWrite(ctx context.Context, fid *srv9p.Fid, data []byte, offset int64) (int, error) {
 	a := fid.Aux().(*fidAux)
 	n := len(data)
 
@@ -368,7 +375,7 @@ func (s *Server) srvWrite(ctx context.Context, fid *srv9p.Fid, data []byte, offs
 			if cmd == "" {
 				continue
 			}
-			w := s.getWin(a.winID)
+			w := fs.s.GetWin(a.winID)
 			if w == nil {
 				return 0, fmt.Errorf("window gone")
 			}
@@ -387,13 +394,13 @@ func (s *Server) srvWrite(ctx context.Context, fid *srv9p.Fid, data []byte, offs
 		// Parse eagerly on each write, as acme does (w->hasaddr updated on Twrite).
 		var q0, q1 int
 		if _, err := fmt.Sscanf(strings.TrimSpace(string(a.wbuf)), "%d %d", &q0, &q1); err == nil {
-			if w := s.getWin(a.winID); w != nil {
+			if w := fs.s.GetWin(a.winID); w != nil {
 				w.SetAddr(a.layID, q0, q1)
 			}
 		}
 
 	case ftName:
-		w := s.getWin(a.winID)
+		w := fs.s.GetWin(a.winID)
 		if w == nil {
 			return 0, fmt.Errorf("window gone")
 		}
@@ -409,20 +416,20 @@ func (s *Server) srvWrite(ctx context.Context, fid *srv9p.Fid, data []byte, offs
 	return n, nil
 }
 
-func (s *Server) srvClunk(fid *srv9p.Fid) {
+func (fs *fsServer) srvClunk(fid *srv9p.Fid) {
 	a, ok := fid.Aux().(*fidAux)
 	if !ok || a == nil || a.ft != ftStyle || len(a.wbuf) == 0 {
 		return
 	}
-	w := s.getWin(a.winID)
+	w := fs.s.GetWin(a.winID)
 	if w == nil {
 		return
 	}
-	palette, runs := parseStyleContent(string(a.wbuf))
+	palette, runs := server.ParseStyleContent(string(a.wbuf))
 	if a.hasAddr {
-		absRuns := make([]StyleRun, 0, len(runs))
+		absRuns := make([]style.StyleRun, 0, len(runs))
 		for _, r := range runs {
-			abs := StyleRun{
+			abs := style.StyleRun{
 				Name:  r.Name,
 				Start: r.Start + a.addrQ0,
 				End:   r.End + a.addrQ0,

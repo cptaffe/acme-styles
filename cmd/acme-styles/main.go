@@ -10,6 +10,7 @@ import (
 
 	"9fans.net/go/acme"
 	"9fans.net/go/plan9/client"
+	"github.com/cptaffe/acme-styles/internal/server"
 	"github.com/cptaffe/acme-styles/logger"
 	"go.uber.org/zap"
 )
@@ -40,13 +41,13 @@ func main() {
 		srvPath = client.Namespace() + "/acme-styles"
 	}
 
-	var cfg Config
+	var cfg server.Config
 	if *stylesFile != "" {
 		data, err := os.ReadFile(*stylesFile)
 		if err != nil {
 			l.Fatal("read styles", zap.String("path", *stylesFile), zap.Error(err))
 		}
-		cfg = ParseConfig(string(data))
+		cfg = server.ParseConfig(string(data))
 		l.Info("loaded styles",
 			zap.Int("palette", len(cfg.Palette)),
 			zap.Int("layerOrder", len(cfg.LayerOrder)),
@@ -57,7 +58,7 @@ func main() {
 	defer stop()
 	ctx = logger.NewContext(ctx, l)
 
-	s := newServer(cfg, ctx)
+	s := server.NewServer(cfg, ctx)
 	go watchLog(s)
 
 	conn, cleanup, err := listen(srvPath)
@@ -70,11 +71,11 @@ func main() {
 	}()
 
 	l.Info("serving", zap.String("path", srvPath))
-	s.buildSrv9p().Serve(conn, conn)
+	(&fsServer{s: s}).buildSrv9p().Serve(conn, conn)
 
 	l.Info("shutting down; waiting for window goroutines")
 	done := make(chan struct{})
-	go func() { s.wg.Wait(); close(done) }()
+	go func() { s.Wait(); close(done) }()
 	select {
 	case <-done:
 		l.Info("shutdown complete")
@@ -84,18 +85,19 @@ func main() {
 }
 
 // watchLog seeds window state from acme and then streams opens/closes.
-func watchLog(s *Server) {
-	l := logger.L(s.ctx)
+func watchLog(s *server.Server) {
+	ctx := s.Ctx()
+	l := logger.L(ctx)
 
-	wins, err := acme.Windows()
+	wins, err := retryOn(ctx, 10, 200*time.Millisecond, acme.Windows)
 	if err != nil {
 		l.Fatal("acme.Windows", zap.Error(err))
 	}
 	for _, w := range wins {
-		s.addWin(w.ID)
+		s.AddWin(w.ID)
 	}
 
-	lr, err := acme.Log()
+	lr, err := retryOn(ctx, 10, 200*time.Millisecond, acme.Log)
 	if err != nil {
 		l.Fatal("acme.Log", zap.Error(err))
 	}
@@ -117,24 +119,47 @@ func watchLog(s *Server) {
 
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 		case res := <-ch:
 			if res.err != nil {
-				if s.ctx.Err() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				l.Fatal("acme log", zap.Error(res.err))
 			}
 			switch res.ev.Op {
 			case "new":
-				s.addWin(res.ev.ID)
+				s.AddWin(res.ev.ID)
 			case "del":
-				s.delWin(res.ev.ID)
+				s.DelWin(res.ev.ID)
 			}
 			readNext()
 		}
 	}
 }
 
-
+// retryOn calls fn repeatedly until it succeeds, the context is cancelled,
+// or maxAttempts is exhausted.
+func retryOn[T any](ctx context.Context, maxAttempts int, delay time.Duration, fn func() (T, error)) (T, error) {
+	var (
+		zero T
+		err  error
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var v T
+		v, err = fn()
+		if err == nil {
+			return v, nil
+		}
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return zero, err
+}

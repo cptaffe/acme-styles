@@ -16,6 +16,10 @@
 // can use Write with raw wire-format text:
 //
 //	sl.Write(":keyword fg=#569cd6\n10 3 keyword\n")
+//
+// Or use the style package to construct the wire format from typed values:
+//
+//	sl.WriteAt(q0, q1, style.Format(palette, runs))
 package layer
 
 import (
@@ -27,16 +31,12 @@ import (
 
 	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
+	"github.com/cptaffe/acme-styles/style"
 )
 
 // Entry is a contiguous highlight span in an acme window body.
-// Start is inclusive, End is exclusive (rune offsets).
-// Name is a palette entry name, e.g. "keyword" or "comment".
-type Entry struct {
-	Name  string
-	Start int
-	End   int // exclusive
-}
+// It is an alias for style.StyleRun; the two types are interchangeable.
+type Entry = style.StyleRun
 
 // StyleLayer is a client handle for one named layer in the acme-styles
 // compositor.  A single 9P connection is shared across all StyleLayer
@@ -95,6 +95,21 @@ func Open(winID int, name string) (*StyleLayer, error) {
 		return nil, err
 	}
 	return &StyleLayer{WinID: winID, LayerID: layID, name: name}, nil
+}
+
+// FindLayer returns a StyleLayer for the named layer on winID if it already
+// exists in the compositor.  Returns nil, false if the compositor is
+// unreachable or no layer with that name exists.
+func FindLayer(winID int, name string) (*StyleLayer, bool) {
+	fs, err := currentFsys()
+	if err != nil {
+		return nil, false
+	}
+	id, ok := Find(fs, winID, name)
+	if !ok {
+		return nil, false
+	}
+	return &StyleLayer{WinID: winID, LayerID: id, name: name}, true
 }
 
 // Apply writes the given highlight spans to the layer using the master
@@ -159,6 +174,52 @@ func (sl *StyleLayer) Write(text string) error {
 	}
 	defer fid.Close()
 	_, err = fid.Write([]byte(text))
+	if err != nil {
+		resetFsys()
+	}
+	return err
+}
+
+// WriteAt writes text to the layer scoped to the range [q0, q1).  The
+// compositor captures the addr at style-open time, so this method writes
+// the addr file first and then opens the style file.
+//
+// text should contain the wire-format content for the range — palette lines
+// followed by run lines with offsets relative to q0.  Use style.Format to
+// construct text from typed values.
+//
+// This is the correct API for tools that apply a highlight to a specific
+// selection rather than replacing the entire layer.
+func (sl *StyleLayer) WriteAt(q0, q1 int, text string) error {
+	if sl == nil {
+		return nil
+	}
+	fs, err := currentFsys()
+	if err != nil {
+		return err
+	}
+
+	// Write addr first — the compositor captures it when style is opened.
+	addrFid, err := fs.Open(fmt.Sprintf("%d/layers/%d/addr", sl.WinID, sl.LayerID), plan9.OWRITE)
+	if err != nil {
+		resetFsys()
+		return fmt.Errorf("open addr: %w", err)
+	}
+	_, werr := fmt.Fprintf(addrFid, "%d %d", q0, q1)
+	addrFid.Close()
+	if werr != nil {
+		resetFsys()
+		return fmt.Errorf("write addr: %w", werr)
+	}
+
+	// Open style — addr is captured at Topen.
+	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.WinID, sl.LayerID), plan9.OWRITE)
+	if err != nil {
+		resetFsys()
+		return fmt.Errorf("open style: %w", err)
+	}
+	_, err = fid.Write([]byte(text))
+	fid.Close()
 	if err != nil {
 		resetFsys()
 	}
