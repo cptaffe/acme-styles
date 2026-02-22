@@ -50,9 +50,8 @@ func listen(srvPath string) (io.ReadWriteCloser, func(), error) {
 	child.Close() // parent closes child end
 
 	cleanup := func() {
-		parent.Close()
-		cmd.Process.Kill() //nolint:errcheck — passer may have already exited
-		cmd.Wait()         //nolint:errcheck
+		parent.Close() // 9pserve gets EOF on stdin and exits naturally
+		cmd.Wait()     //nolint:errcheck
 	}
 	return parent, cleanup, nil
 }
