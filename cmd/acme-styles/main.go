@@ -87,7 +87,7 @@ func main() {
 func watchLog(s *Server) {
 	l := logger.L(s.ctx)
 
-	wins, err := retryOn(s.ctx, 10, 200*time.Millisecond, acme.Windows)
+	wins, err := acme.Windows()
 	if err != nil {
 		l.Fatal("acme.Windows", zap.Error(err))
 	}
@@ -95,7 +95,7 @@ func watchLog(s *Server) {
 		s.addWin(w.ID)
 	}
 
-	lr, err := retryOn(s.ctx, 10, 200*time.Millisecond, acme.Log)
+	lr, err := acme.Log()
 	if err != nil {
 		l.Fatal("acme.Log", zap.Error(err))
 	}
@@ -137,27 +137,4 @@ func watchLog(s *Server) {
 	}
 }
 
-// retryOn calls fn repeatedly until it succeeds, the context is cancelled,
-// or maxAttempts is exhausted.
-func retryOn[T any](ctx context.Context, maxAttempts int, delay time.Duration, fn func() (T, error)) (T, error) {
-	var (
-		zero T
-		err  error
-	)
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		var v T
-		v, err = fn()
-		if err == nil {
-			return v, nil
-		}
-		if ctx.Err() != nil {
-			return zero, ctx.Err()
-		}
-		select {
-		case <-ctx.Done():
-			return zero, ctx.Err()
-		case <-time.After(delay):
-		}
-	}
-	return zero, err
-}
+
